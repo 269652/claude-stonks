@@ -66,7 +66,8 @@ class TestLiveViewBook:
     def test_live_net_worth_is_real_cash_plus_real_positions(self, settings, books):
         s = view(settings, "live")
         assert s["cash"] == pytest.approx(120.0)
-        assert s["equity"] == pytest.approx(150.0)     # not + the paper 50
+        # real cash + real position net of its 1 EUR exit fee; not + the paper 50
+        assert s["equity"] == pytest.approx(149.0)
 
     def test_unarmed_live_rows_have_no_action_handles(self, settings, books):
         row = view(settings, "live")["positions"][0]

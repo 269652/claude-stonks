@@ -167,9 +167,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # for paper mode, use the recorded equity curve (which includes cash + all holdings).
         if is_live and cash is not None:
             # Real live: equity = TR cash + unrealized P&L on open positions
-            positions_value = sum(
-                (m.get("value") or 0.0) for m in book.get_meta("open_option_marks", {}).values()
-            )
+            # Liquidation value: each marked position net of its exit fee —
+            # equals cash + sum(cost + unrealized P&L) over the rows.
+            open_ids = {str(o.get("id")) for o in open_opts}
+            marked = [m for k, m in (book.get_meta("open_option_marks", {}) or {}).items()
+                      if k in open_ids and m.get("value") is not None]
+            positions_value = sum(m["value"] - OPTION_FEE for m in marked)
             equity = cash + positions_value
         else:
             curve = store().equity_curve(limit=300)
@@ -185,6 +188,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             {"symbol": p.symbol, "qty": round(p.qty, 6),
              "avg_price": round(p.avg_price, 4), "kind": "equity", "isin": None,
              "value": None, "unrealized_pnl": None, "price": None, "spot": None,
+             "liquidation_value": None,
              "id": None, "close_kind": "equity" if can_act else None,
              "close_symbol": p.symbol,
              "close_pending": {"kind": "equity", "symbol": p.symbol} in pending}
@@ -218,6 +222,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "isin": o.get("isin"),
                 "value": mark.get("value") if mark else None,
                 "unrealized_pnl": mark.get("unrealized_pnl") if mark else None,
+                "liquidation_value": (round(mark["value"] - OPTION_FEE, 4)
+                                      if mark and mark.get("value") is not None else None),
                 # Current premium per unit (what the P&L is marked at) and the
                 # underlying's price, from the engine's latest mark.
                 "price": mark.get("mark_premium") if mark else None,

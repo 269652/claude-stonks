@@ -96,7 +96,9 @@ function paintSummary(s) {
   const econ = s.economics || {};
   const ctrl = window._ctrl || {};
   const isLive = ctrl.mode === "live";
-  const posValue = (s.positions || []).reduce((a, p) => a + (p.value || 0), 0);
+  // Liquidation value (value minus the exit fee): net worth = cash + this.
+  const posValue = (s.positions || []).reduce(
+    (a, p) => a + (p.liquidation_value != null ? p.liquidation_value : (p.value || 0)), 0);
 
   // In LIVE mode the headline figures are the REAL Trade Republic account —
   // cash from the live balance, net worth = real cash + open position value,

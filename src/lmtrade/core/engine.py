@@ -563,6 +563,12 @@ class Engine:
             self._persist_option_marks(prices)
             self._record_equity_point(prices)
 
+    def _open_exit_fees(self) -> float:
+        """Fees still due to sell every open position (net worth is what
+        you'd have after liquidating, not the gross mark)."""
+        return (OPTION_FEE * len(self.store.open_options())
+                + float(getattr(self.broker, "fee", 0.0) or 0.0) * len(self.store.positions()))
+
     EQUITY_POINT_S = 30.0   # extra equity-curve points while positions are open
 
     def _record_equity_point(self, prices: dict[str, float]) -> None:
@@ -578,7 +584,8 @@ class Engine:
         else:
             cash = self.broker.cash()
         all_prices = {**self._last_good_price, **prices}
-        equity = cash + self._positions_value(all_prices) + self._options_value(all_prices)
+        equity = (cash + self._positions_value(all_prices) + self._options_value(all_prices)
+                  - self._open_exit_fees())
         self.store.record_equity(cash, equity, self.store.total_costs().get("fee", 0.0))
         self._last_equity_point = time.time()
 
@@ -1467,7 +1474,10 @@ class Engine:
                         self.bus.activity("trade", f"SELL {symbol} — {why}", symbol)
 
         cash = self.broker.cash()
-        total_value = self._positions_value(prices) + self._options_value(prices)
+        # Liquidation value: what the holdings are worth after the exit fee
+        # each one still costs to sell.
+        total_value = (self._positions_value(prices) + self._options_value(prices)
+                       - self._open_exit_fees())
         self._persist_option_marks(prices)
         # Live TR account cash for the dashboard, refreshed at most every few
         # minutes rather than every cycle — each fetch opens a websocket, so
@@ -1602,7 +1612,8 @@ class Engine:
                 self._prune_watchlist_entered()
 
         cash = self.broker.cash()
-        equity = cash + self._positions_value(prices) + self._options_value(prices)
+        equity = (cash + self._positions_value(prices) + self._options_value(prices)
+                  - self._open_exit_fees())
         fees = self.store.total_costs().get("fee", 0.0)
         # A failed live cash read reports 0 — never record that as the account
         # value (it showed up as 0-EUR spikes that flattened the whole curve).
