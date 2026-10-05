@@ -58,7 +58,19 @@
     return out;
   }
 
-  const api = { chartModel, nearestIndex, withLivePoint };
+  // TR heartbeat state for the header dot: none | pending (sent, no answer
+  // yet) | ok | stale (no answer for 2 intervals) | down (re-login failed).
+  function heartbeatState(trs, nowTs) {
+    if (!trs) return "none";
+    if (trs.ok === false) return "down";
+    const interval = Number(trs.interval) || 30;
+    const ts = Number(trs.ts) || 0, sent = Number(trs.sent_ts) || 0;
+    if (sent > ts) return nowTs - sent > 2 * interval ? "stale" : "pending";
+    if (nowTs - ts > 2 * interval) return "stale";
+    return "ok";
+  }
+
+  const api = { chartModel, nearestIndex, withLivePoint, heartbeatState };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LMChart = api;
 })(typeof window !== "undefined" ? window : this);

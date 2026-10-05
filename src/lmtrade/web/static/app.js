@@ -155,6 +155,7 @@ function paintSummary(s) {
   }
 
   // Provider warning banner (e.g. Claude usage limit hit)
+  paintHeartbeat(s.tr_session);
   const pwBanner = $("provider-warning-banner");
   const pw = s.provider_warnings;
   const trs = s.tr_session;
@@ -169,6 +170,24 @@ function paintSummary(s) {
   } else {
     pwBanner.classList.remove("show");
   }
+}
+
+// Header dot = TR heartbeat: colour by state, a blink whenever a new answer
+// from TR has arrived since the last refresh.
+let lastBeatTs = null;
+function paintHeartbeat(trs) {
+  const dot = $("hb-dot");
+  const state = LMChart.heartbeatState(trs, Date.now() / 1000);
+  dot.className = "dot hb-" + state;
+  const t = v => v ? time(v) : "—";
+  dot.title = trs
+    ? `TR heartbeat: ${state} · sent ${t(trs.sent_ts)} · answered ${t(trs.ts)}`
+    : "TR heartbeat: no data (no TR connection)";
+  if (trs && trs.ts && lastBeatTs !== null && trs.ts !== lastBeatTs && state === "ok") {
+    void dot.offsetWidth;            // restart the animation
+    dot.classList.add("hb-blink");
+  }
+  if (trs && trs.ts) lastBeatTs = trs.ts;
 }
 
 function pnlCell(v) {

@@ -174,3 +174,63 @@ class TestDashboard:
         js = (Path(__file__).parents[1] / "src" / "lmtrade" / "web" / "static"
               / "app.js").read_text(encoding="utf-8")
         assert "tr_session" in js and "TR connection" in js
+
+
+class TestHeartbeatTimestamps:
+    def test_sent_and_received_recorded(self, settings, store):
+        c = FakeClient()
+        e = engine(settings, store, c)
+        e._tr_heartbeat()
+        st = store.get_meta("tr_session")
+        assert st["ok"] is True and st["sent_ts"] <= st["ts"]
+        assert st["interval"] == pytest.approx(settings.tr.heartbeat_seconds)
+
+    def test_failure_keeps_sent_ts(self, settings, store):
+        c = FakeClient(alive=False, relogin_ok=False)
+        e = engine(settings, store, c)
+        e._tr_heartbeat()
+        st = store.get_meta("tr_session")
+        assert st["ok"] is False and st["sent_ts"] > 0
+
+
+import json
+import shutil
+import subprocess
+
+CHART_JS = Path(__file__).parents[1] / "src" / "lmtrade" / "web" / "static" / "chart.js"
+NODE = shutil.which("node")
+
+
+def js_state(trs, now):
+    script = (f"const C = require({json.dumps(str(CHART_JS))});"
+              f"process.stdout.write(JSON.stringify(C.heartbeatState({json.dumps(trs)}, {now})));")
+    out = subprocess.run([NODE, "-e", script], capture_output=True, text=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+class TestHeartbeatDotState:
+    def test_none(self):
+        assert js_state(None, 100) == "none"
+
+    def test_ok(self):
+        assert js_state({"ok": True, "ts": 95, "sent_ts": 94, "interval": 30}, 100) == "ok"
+
+    def test_pending_while_waiting_for_answer(self):
+        assert js_state({"ok": True, "ts": 60, "sent_ts": 99, "interval": 30}, 100) == "pending"
+
+    def test_stale_when_no_answer_for_two_intervals(self):
+        assert js_state({"ok": True, "ts": 20, "sent_ts": 19, "interval": 30}, 100) == "stale"
+
+    def test_down(self):
+        assert js_state({"ok": False, "ts": 99, "sent_ts": 99, "interval": 30}, 100) == "down"
+
+
+class TestHeaderDotWired:
+    def test_dot_has_id_and_is_driven_by_heartbeat(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        js = (web / "static" / "app.js").read_text(encoding="utf-8")
+        assert 'id="hb-dot"' in html and ".hb-blink" in html
+        assert "heartbeatState" in js and "hb-blink" in js

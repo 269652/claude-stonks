@@ -608,22 +608,27 @@ class Engine:
         self._last_heartbeat = now
         primary = clients[0]
         was = self.store.get_meta("tr_session") or {}
+        # "sent" first, so the dashboard's dot can show a heartbeat in flight.
+        self.store.set_meta("tr_session", {**was, "sent_ts": now, "interval": interval})
         if primary.heartbeat():
             if was.get("ok") is False:
                 self.bus.info("[tr] connection back", source="engine")
-            self.store.set_meta("tr_session", {"ok": True, "ts": now})
+            self.store.set_meta("tr_session", {"ok": True, "ts": time.time(),
+                                               "sent_ts": now, "interval": interval})
             return
         self.bus.warn("[tr] heartbeat: TR not responding — re-logging in", source="engine")
         ok = all(c.relogin() for c in clients)
         if ok:
             self.bus.info("[tr] re-logged in — session restored", source="engine")
-            self.store.set_meta("tr_session", {"ok": True, "ts": now})
+            self.store.set_meta("tr_session", {"ok": True, "ts": time.time(),
+                                               "sent_ts": now, "interval": interval})
             return
         msg = ("TR not responding and re-login failed — the saved session has probably "
                "expired: run `pytr login --store_credentials` (2FA) once; the bot picks "
                "it up automatically.")
         self.bus.error(f"[tr] {msg}", source="engine")
-        self.store.set_meta("tr_session", {"ok": False, "ts": now,
+        self.store.set_meta("tr_session", {"ok": False, "ts": now, "sent_ts": now,
+                                           "interval": interval,
                                            "since": was.get("since") if was.get("ok") is False
                                            else now, "msg": msg})
 
