@@ -455,7 +455,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         real = (store_for("live").get_meta("tr_account_cash")
                 or store_for("paper").get_meta("tr_account_cash"))
         if real is not None:
-            return float(real)
+            # Net worth = real cash + live positions after their exit fee
+            # (the guard is about net worth, not cash alone).
+            book = store_for("live")
+            open_ids = {str(o.get("id")) for o in book.open_options()}
+            marks = book.get_meta("open_option_marks", {}) or {}
+            held = sum(m["value"] - OPTION_FEE for k, m in marks.items()
+                       if k in open_ids and m.get("value") is not None)
+            return float(real) + held
         nw = econ.get("net_worth_eur")
         return float(nw) if nw is not None else None
 

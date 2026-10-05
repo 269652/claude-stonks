@@ -564,6 +564,13 @@ class Engine:
             self._persist_option_marks(prices)
             self._record_equity_point(prices)
 
+    def _guard_net_worth(self) -> float:
+        """Net worth for the low-balance guard: cash + holdings after the exit
+        fee each still costs (not cash alone — cash drops when it's invested)."""
+        prices = self._last_good_price
+        return (self.broker.cash() + self._positions_value(prices)
+                + self._options_value(prices) - self._open_exit_fees())
+
     def _open_exit_fees(self) -> float:
         """Fees still due to sell every open position (net worth is what
         you'd have after liquidating, not the gross mark)."""
@@ -984,8 +991,7 @@ class Engine:
                               f"minimum — no order", source="engine")
                 return None
             from .control import ControlState
-            if ControlState.load(self.settings.control_path).low_balance_blocks(
-                    self.broker.cash()):
+            if ControlState.load(self.settings.control_path).low_balance_blocks(self._guard_net_worth()):
                 self.bus.warn(f"LIVE limit order blocked [{inst['isin']}]: balance under "
                               f"€{LOW_BALANCE_EUR:.0f} and the low-balance guard is not armed.",
                               source="engine")
@@ -1344,7 +1350,7 @@ class Engine:
             # are blocked unless the user has explicitly armed the second guard.
             # Checked live against the REAL account balance every order, so it
             # engages the moment net worth drops under the threshold.
-            net_worth = self.broker.cash()
+            net_worth = self._guard_net_worth()
             if control.low_balance_blocks(net_worth):
                 self.bus.warn(
                     f"LIVE order blocked [{ko.isin}]: balance "
