@@ -58,6 +58,7 @@ EDITABLE: list[tuple[str, str, list[str] | None]] = [
     ("research.news_retry_minutes", "int", None),
     ("research.claude_cli_timeout_seconds", "number", None),
     ("tr.use_derivatives", "bool", None),
+    ("tr.heartbeat_seconds", "number", None),
     ("tr.target_leverage", "number", None),
     ("data.provider", "select", ["auto", "yahoo", "synthetic"]),
 ]

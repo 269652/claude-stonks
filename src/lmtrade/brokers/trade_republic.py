@@ -122,6 +122,18 @@ class TradeRepublicBroker(Broker):
         self.last_cash_ok = True
         return value
 
+    def heartbeat(self) -> bool:
+        """True when TR answers a (bounded) cash read right now."""
+        self.cash()
+        return self.last_cash_ok
+
+    def relogin(self) -> bool:
+        """Drop the session and log in again immediately, ignoring the retry
+        backoff a failure armed. True when a session could be resumed."""
+        self._invalidate()
+        self._next_retry = 0.0
+        return self._login() is not None
+
     def price(self, symbol: str) -> float:
         return 0.0  # engine passes live prices from the data layer
 

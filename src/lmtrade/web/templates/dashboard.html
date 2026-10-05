@@ -98,10 +98,12 @@
   input.inline-exit-input { width:80px; background:var(--bg); border:1px solid var(--blue);
              color:var(--text); border-radius:4px; padding:1px 4px; font-size:12px; }
   input.inline-exit-input.bad { border-color:var(--red); }
+  .exits-wrap { display:flex; align-items:center; gap:10px; }
   .exits-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
-               color:var(--muted); border-radius:6px; padding:1px 8px; font-size:12px;
-               margin-top:3px; }
+               color:var(--muted); border-radius:6px; padding:3px 8px; font-size:13px;
+               line-height:1; flex:none; }
   .exits-btn:hover { color:var(--text); border-color:var(--blue); }
+  .exits-btn.custom { color:var(--blue); border-color:var(--blue); }
   .close-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
                color:var(--muted); border-radius:6px; padding:3px 10px; font-size:12px; }
   .close-btn:hover { color:var(--red); border-color:var(--red); }

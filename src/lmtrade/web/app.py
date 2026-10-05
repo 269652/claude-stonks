@@ -258,6 +258,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "positions": rows,
             "num_positions": len(rows),
             "provider_warnings": store().get_meta("provider_warnings"),
+            "tr_session": _tr_meta("tr_session"),
             "alpha": store().get_meta("alpha"),
         })
 

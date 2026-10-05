@@ -157,7 +157,12 @@ function paintSummary(s) {
   // Provider warning banner (e.g. Claude usage limit hit)
   const pwBanner = $("provider-warning-banner");
   const pw = s.provider_warnings;
-  if (pw && pw.msg) {
+  const trs = s.tr_session;
+  if (trs && trs.ok === false) {
+    // TR heartbeat + automatic re-login failed: needs a manual pytr login.
+    pwBanner.innerHTML = `⛔ <b>TR connection lost</b> since ${time(trs.since || trs.ts)} — ${trs.msg}`;
+    pwBanner.classList.add("show");
+  } else if (pw && pw.msg) {
     pwBanner.innerHTML = `⚠️ <b>Research provider warning:</b> ${pw.msg}
       <button onclick="dismissProviderWarning()" style="margin-left:12px;padding:2px 8px;cursor:pointer;border-radius:4px;border:none;background:#555;color:#fff;font-size:12px">Dismiss</button>`;
     pwBanner.classList.add("show");
@@ -195,11 +200,14 @@ function exitsCell(p) {
       ? `<span class="lock">🔒 Trail ≥ ${eur(t.stop_pnl)}</span> <span class="muted">(peak ${eur(t.peak_pnl)})</span>`
       : `<span class="muted">Trail arms at ${eur(t.arm_pnl)}</span>`);
   }
-  if (p.close_kind === "option" && p.id != null) {
-    parts.push(`<button class="exits-btn" data-id="${p.id}" title="Configure exits">`
-      + `${p.exits_custom ? "✎ custom" : "+"}</button>`);
-  }
-  return parts.length ? `<td class="exits">${parts.join("<br>")}</td>` : `<td class="muted">—</td>`;
+  // Lines on the left, edit pencil beside them (highlighted when custom).
+  const btn = p.close_kind === "option" && p.id != null
+    ? `<button class="exits-btn${p.exits_custom ? " custom" : ""}" data-id="${p.id}"`
+      + ` title="${p.exits_custom ? "Custom exits — edit" : "Configure exits"}">✎</button>`
+    : "";
+  return parts.length
+    ? `<td class="exits"><div class="exits-wrap"><div class="exits-lines">${parts.join("<br>")}</div>${btn}</div></td>`
+    : `<td class="muted">—</td>`;
 }
 
 function closeButton(p) {

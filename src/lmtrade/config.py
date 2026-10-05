@@ -206,6 +206,9 @@ class TRConfig(BaseModel):
     # options layer is used. Login is via pytr (unofficial, against TR ToS —
     # see docs/TRADE_REPUBLIC.md).
     use_derivatives: bool = True
+    # Check every N seconds that TR still answers; re-login immediately when
+    # it doesn't. 0 = off.
+    heartbeat_seconds: float = 30.0
     target_leverage: float = 5.0    # preferred KO leverage when selecting
 
 

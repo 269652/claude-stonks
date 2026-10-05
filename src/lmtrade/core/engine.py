@@ -101,6 +101,7 @@ class Engine:
         self._last_exit_check = 0.0     # wall clock of the last fast exit check
         self._last_portfolio_check = 0.0  # wall clock of the last live fill reconciliation
         self._last_cash: float | None = None   # last successfully read cash
+        self._last_heartbeat = 0.0               # wall clock of the last TR heartbeat
         self._last_equity_point = 0.0           # wall clock of the last equity point
         self._fast_exit_checks = 0
         store.set_meta("mode", broker.mode)
@@ -589,6 +590,43 @@ class Engine:
         self.store.record_equity(cash, equity, self.store.total_costs().get("fee", 0.0))
         self._last_equity_point = time.time()
 
+    def _tr_heartbeat(self) -> None:
+        """Every tr.heartbeat_seconds: check TR still answers; if not, drop
+        the session and re-login right away. A failed re-login (saved session
+        expired -> manual `pytr login` with 2FA) is surfaced on the dashboard
+        via meta "tr_session"."""
+        interval = self.settings.tr.heartbeat_seconds
+        if interval <= 0:
+            return
+        clients = [c for c in (self.broker, self.tr_derivatives)
+                   if c is not None and hasattr(c, "heartbeat") and hasattr(c, "relogin")]
+        if not clients:
+            return
+        now = time.time()
+        if now - self._last_heartbeat < interval:
+            return
+        self._last_heartbeat = now
+        primary = clients[0]
+        was = self.store.get_meta("tr_session") or {}
+        if primary.heartbeat():
+            if was.get("ok") is False:
+                self.bus.info("[tr] connection back", source="engine")
+            self.store.set_meta("tr_session", {"ok": True, "ts": now})
+            return
+        self.bus.warn("[tr] heartbeat: TR not responding — re-logging in", source="engine")
+        ok = all(c.relogin() for c in clients)
+        if ok:
+            self.bus.info("[tr] re-logged in — session restored", source="engine")
+            self.store.set_meta("tr_session", {"ok": True, "ts": now})
+            return
+        msg = ("TR not responding and re-login failed — the saved session has probably "
+               "expired: run `pytr login --store_credentials` (2FA) once; the bot picks "
+               "it up automatically.")
+        self.bus.error(f"[tr] {msg}", source="engine")
+        self.store.set_meta("tr_session", {"ok": False, "ts": now,
+                                           "since": was.get("since") if was.get("ok") is False
+                                           else now, "msg": msg})
+
     def _poll_close_requests(self) -> None:
         if self.store.get_meta("close_requests"):
             self.process_close_requests()
@@ -603,6 +641,7 @@ class Engine:
             time.sleep(min(1.0, remaining))
             self._poll_close_requests()
             self._check_exits_fast()
+            self._tr_heartbeat()
 
     def _record_learning(self, genome_id: str | None, pnl: float) -> None:
         if not (self.optimizer and genome_id):
@@ -1530,6 +1569,7 @@ class Engine:
             evaluated: set[str] = set()   # symbols whose signal was re-read this cycle
             for symbol in self.settings.universe:
                 self._check_exits_fast()      # keep exits responsive mid-cycle
+                self._tr_heartbeat()
                 if slots <= 0:
                     break
                 if symbol not in tradeable:

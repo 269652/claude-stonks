@@ -210,3 +210,15 @@ class TestModalWiring:
         html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
         assert 'id="exits-overlay"' in html
         assert "/api/positions/exits" in js and "exits-btn" in js
+
+
+class TestExitsCellLayout:
+    def test_pencil_button_beside_the_lines(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        js = (web / "static" / "app.js").read_text(encoding="utf-8")
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        cell = js[js.index("function exitsCell"):js.index("function closeButton")]
+        assert "exits-lines" in cell                     # lines in their own block
+        assert '"✎ custom" : "+"' not in cell and "✎ custom" not in cell
+        assert "✎" in cell                               # always a pencil
+        assert ".exits-wrap" in html and "display:flex" in html[html.index(".exits-wrap"):][:120]

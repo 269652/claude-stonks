@@ -497,6 +497,16 @@ class PytrDerivatives(TRDerivativesBase):
             return None
         return price if price and price > 0 else None
 
+    def heartbeat(self) -> bool:
+        """True when TR answers a (bounded) cash read right now."""
+        return self.account_cash() is not None
+
+    def relogin(self) -> bool:
+        """Drop the session and log in again immediately (no backoff)."""
+        self._invalidate()
+        self._next_retry = 0.0
+        return self._login() is not None
+
     def account_cash(self) -> float | None:
         api = self._login()
         if api is None:
