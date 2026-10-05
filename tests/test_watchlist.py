@@ -5,6 +5,8 @@ signal disappears or flips, and expires after max_hours.
 Written before implementation (TDD). Offline: market and decisions are faked."""
 from __future__ import annotations
 
+import time
+
 from pathlib import Path
 
 import pytest
@@ -208,3 +210,84 @@ class TestEngineWatchlist:
         e.run_cycle()
         assert len(store.open_options()) == 1
         assert not store.get_meta("watchlist")
+
+
+class TestWatchlistVisibility:
+    """The dashboard's Watchlist tab: what is being watched, how far each
+    signal is from its entry trigger and how long it has left."""
+
+    def test_current_z_recorded_each_cycle(self, settings, store):
+        e, market, clock = make(settings, store)
+        force(e)
+        market.price = 100.5                  # z ~ +0.5
+        e.run_cycle()
+        w = store.get_meta("watchlist")["AAPL"]
+        assert w["z"] == pytest.approx(entry_z(100.5, HIST[:-1] + [100.5], 60), abs=1e-4)
+        assert w["checked_ts"] == pytest.approx(clock.t)
+
+    def test_api_lists_entries_with_trigger_and_expiry(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        e, market, clock = make(settings, store)
+        force(e)
+        market.price = 100.5
+        e.run_cycle()
+        rows = TestClient(create_app(settings)).get("/api/watchlist").json()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["symbol"] == "AAPL" and r["direction"] == "buy"
+        assert r["instrument"] == "call"
+        assert r["z"] == pytest.approx(entry_z(100.5, HIST[:-1] + [100.5], 60), abs=1e-4) and r["k"] == pytest.approx(1.0)
+        assert r["trigger_z"] == pytest.approx(-1.0)
+        assert r["sigma_to_go"] == pytest.approx(entry_z(100.5, HIST[:-1] + [100.5], 60) + 1.0, abs=1e-3)
+        assert r["expires_ts"] == pytest.approx(r["added_ts"] + 4 * 3600)
+
+    def test_api_empty_when_nothing_watched(self, settings):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        assert TestClient(create_app(settings)).get("/api/watchlist").json() == []
+
+    def test_tab_present(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        js = (web / "static" / "app.js").read_text(encoding="utf-8")
+        assert 'data-tab="watchlist"' in html and 'id="tab-watchlist"' in html
+        assert "/api/watchlist" in js and "paintWatchlist" in js
+
+
+class TestSignalsShowEntryDistance:
+    def test_signals_table_has_entry_column_fed_by_watchlist(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        js = (web / "static" / "app.js").read_text(encoding="utf-8")
+        head = html[html.index('<section id="tab-signals"'):]
+        head = head[:head.index("</tr>")]
+        assert "<th>Entry</th>" in head
+        assert "_watchBySym" in js
+        # watchlist must be painted before signals so the lookup is fresh
+        body = js[js.index("async function refresh"):]
+        assert body.index("paintWatchlist(") < body.index("paintSignals(")
+
+
+class TestWatchConfigAndSorting:
+    def test_watch_settings_editable_in_dashboard(self):
+        from lmtrade.web.settings_editor import EDITABLE
+        keys = {k for k, _, _ in EDITABLE}
+        assert {"entry.watch_enabled", "entry.watch_k", "entry.watch_max_hours",
+                "entry.watch_window"} <= keys
+
+    def test_api_sorted_by_distance_ascending_unknown_last(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        now = time.time()
+        store.set_meta("watchlist", {
+            "FAR": {"direction": "buy", "confidence": 0.9, "added_ts": now, "z": 2.0},
+            "NEAR": {"direction": "buy", "confidence": 0.5, "added_ts": now, "z": -0.8},
+            "UNK": {"direction": "sell", "confidence": 0.99, "added_ts": now, "z": None},
+            "MID": {"direction": "sell", "confidence": 0.6, "added_ts": now, "z": 0.5},
+        })
+        rows = TestClient(create_app(settings)).get("/api/watchlist").json()
+        assert [r["symbol"] for r in rows] == ["NEAR", "MID", "FAR", "UNK"]

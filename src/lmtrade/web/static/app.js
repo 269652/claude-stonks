@@ -13,7 +13,8 @@ function sideClass(s) { return s === "buy" ? "buy" : s === "sell" ? "sell" : "ho
 
 async function refresh() {
   try {
-    const [s, trades, activity, logs, equity, strategies, realized, signals, news, analysis, ctrl] =
+    const [s, trades, activity, logs, equity, strategies, realized, signals, news, analysis, ctrl,
+           watch] =
       await Promise.all([
         getJSON("/api/summary"),
         getJSON("/api/trades?limit=100"),
@@ -26,6 +27,7 @@ async function refresh() {
         getJSON("/api/news"),
         getJSON("/api/analysis"),
         getJSON("/api/control"),
+        getJSON("/api/watchlist"),
       ]);
     window._ctrl = ctrl;
     paintControl(ctrl, s);
@@ -38,6 +40,7 @@ async function refresh() {
     paintChart(equity, ctrl.mode === "live" ? null : s.starting_cash);
     paintStrategies(strategies);
     paintRealized(realized);
+    paintWatchlist(watch);   // before signals: they show its entry distance
     paintSignals(signals);
     paintNews(news);
     paintAnalysis(analysis);
@@ -173,10 +176,17 @@ function pnlCell(v) {
 function exitsCell(p) {
   const eur = v => v == null ? "—" : (v >= 0 ? "+" : "") + fmt(v) + " €";
   const parts = [];
-  if (p.tp_price != null)
-    parts.push(`<span class="pos">TP</span> ${fmt(p.tp_price)} <span class="muted">(${eur(p.tp_pnl)})</span>`);
-  if (p.sl_price != null)
-    parts.push(`<span class="neg">SL</span> ${fmt(p.sl_price)} <span class="muted">(${eur(p.sl_pnl)})</span>`);
+  // TP / SL are click-to-edit in place (net EUR); empty input turns them off.
+  const editable = p.close_kind === "option" && p.id != null;
+  const tag = (field, html) => editable
+    ? `<span class="inline-exit" data-id="${p.id}" data-field="${field}" title="Click to edit (€ net)">${html}</span>`
+    : html;
+  parts.push(p.tp_price != null
+    ? tag("tp_pnl", `<span class="pos">TP</span> ${fmt(p.tp_price)} <span class="muted">(${eur(p.tp_pnl)})</span>`)
+    : tag("tp_pnl", `<span class="muted">TP off</span>`));
+  parts.push(p.sl_price != null
+    ? tag("sl_pnl", `<span class="neg">SL</span> ${fmt(p.sl_price)} <span class="muted">(${eur(p.sl_pnl)})</span>`)
+    : tag("sl_pnl", `<span class="muted">SL off</span>`));
   const t = p.trail;
   if (t && t.enabled) {
     parts.push(t.active
@@ -199,15 +209,56 @@ function closeButton(p) {
 }
 
 function paintPositions(rows) {
+  if (window._inlineEditing) return;   // don't wipe an inline TP/SL edit
   window._posRows = {};
   rows.forEach(p => { if (p.id != null) window._posRows[p.id] = p; });
   $("positions").innerHTML = rows.length
     ? rows.map(p => `<tr><td>${p.symbol}</td><td><span class="kind">${p.kind || "equity"}</span></td>`
         + `<td>${p.isin || "—"}</td><td>${fmt(p.qty,4)}</td><td>${fmt(p.avg_price)}</td>`
+        + `<td>${p.price == null ? "—" : fmt(p.price)}`
+        + `${p.spot == null ? "" : `<div class="sub">${p.symbol.split(" ")[0]} ${fmt(p.spot)}</div>`}</td>`
         + `<td>${p.value == null ? "—" : fmt(p.value)}</td>${pnlCell(p.unrealized_pnl)}`
         + `${exitsCell(p)}${closeButton(p)}</tr>`).join("")
-    : `<tr><td colspan="9" class="muted">No open positions.</td></tr>`;
+    : `<tr><td colspan="10" class="muted">No open positions.</td></tr>`;
 }
+
+// Inline TP/SL edit: click the value, type net EUR, Enter/blur saves, Esc cancels.
+$("positions").addEventListener("click", ev => {
+  const span = ev.target.closest(".inline-exit");
+  if (!span || window._inlineEditing) return;
+  const row = window._posRows[span.dataset.id];
+  if (!row) return;
+  const field = span.dataset.field;
+  window._inlineEditing = true;
+  const input = document.createElement("input");
+  input.type = "text"; input.className = "inline-exit-input";
+  input.placeholder = "off";
+  input.value = row[field] == null ? "" : Math.round(row[field] * 100) / 100;
+  span.replaceWith(input);
+  input.focus(); input.select();
+  let done = false;
+  const finish = async save => {
+    if (done) return;
+    if (save) {
+      const body = LMExits.inlineExitBody(row, field, input.value);
+      if (!body) { input.classList.add("bad"); input.focus(); return; }
+      done = true;
+      const res = await postJSON("/api/positions/exits", body);
+      if (!res.ok) alert("Not saved: " + (res.error || "unknown error"));
+    }
+    done = true;
+    window._inlineEditing = false;
+    refresh();
+  };
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter") finish(true);
+    else if (e.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => {
+    if (!done && !input.classList.contains("bad")) finish(true);
+    else if (!done) finish(false);
+  });
+});
 
 // Per-position exits modal (+ / ✎ in the Exits column). Values in net EUR.
 let exitsId = null;
@@ -340,6 +391,46 @@ function sentClass(s) {
   return s === "bullish" ? "buy" : s === "bearish" ? "sell" : "hold";
 }
 
+// Watchlist: signals waiting for a >= k-sigma stretch from the intraday SMA
+// (below for buys -> call, above for sells -> put) before they are entered.
+function paintWatchlist(rows) {
+  rows = rows || [];
+  window._watchBySym = {};
+  rows.forEach(r => { window._watchBySym[r.symbol] = r; });
+  $("watch-count").textContent = rows.length ? ` (${rows.length})` : "";
+  const k = rows.length ? rows[0].k : null;
+  $("watch-note").textContent = rows.length
+    ? `Entered once price is ${k}σ below (buy → call) or above (sell → put) its intraday average; `
+      + "dropped when the signal disappears or the entry expires."
+    : "";
+  const sig = v => v == null ? "—" : (v >= 0 ? "+" : "") + Number(v).toFixed(2) + "σ";
+  const left = ts => {
+    const m = Math.max(0, Math.round((ts - Date.now() / 1000) / 60));
+    return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+  };
+  $("watchlist").innerHTML = rows.length
+    ? rows.map(r => `<tr><td>${r.symbol}</td>`
+        + `<td><span class="${r.direction === "buy" ? "pos" : "neg"}">${r.direction.toUpperCase()}</span>`
+        + ` <span class="kind">${r.instrument}</span></td>`
+        + `<td>${fmt(r.confidence)}</td><td>${sig(r.z)}</td><td>${sig(r.trigger_z)}</td>`
+        + `<td>${r.sigma_to_go == null ? "—" : r.sigma_to_go === 0 ? "ready" : Number(r.sigma_to_go).toFixed(2) + "σ"}</td>`
+        + `<td>${r.order
+              ? `limit ${fmt(r.order.limit)} × ${fmt(r.order.size, 2)}<div class="sub">${r.symbol} @ ${fmt(r.order.target_spot)}${r.order.order_id ? " · " + r.order.order_id : ""}</div>`
+              : `<span class="muted">—</span>`}</td>`
+        + `<td>${left(r.expires_ts)}</td></tr>`).join("")
+    : `<tr><td colspan="8" class="muted">Nothing on the watchlist — new signals appear here while they wait for a good entry.</td></tr>`;
+}
+
+// Watch-list status for a signal: current sigma and how far to the entry.
+function entryDistance(symbol) {
+  const w = (window._watchBySym || {})[symbol];
+  if (!w) return `<span class="muted">not watched</span>`;
+  const z = w.z == null ? "—" : (w.z >= 0 ? "+" : "") + Number(w.z).toFixed(2) + "σ";
+  if (w.sigma_to_go == null) return `<span class="muted">${z}</span>`;
+  if (w.sigma_to_go === 0) return `${z} · <b>ready</b>`;
+  return `${z} · <span class="muted">${Number(w.sigma_to_go).toFixed(2)}σ to go</span>`;
+}
+
 function paintSignals(rows) {
   $("signals").innerHTML = rows && rows.length
     ? rows.map(r => {
@@ -348,9 +439,9 @@ function paintSignals(rows) {
           .map(s => `<span class="pill ${sideClass(s.direction)}">${s.provider} ${fmt(s.confidence)}</span> ${s.rationale || ""}`)
           .join("<br>") || `<span class="muted">${r.rationale || "—"}</span>`;
         return `<tr><td>${r.symbol}</td><td><span class="pill ${sideClass(r.direction)}">${r.direction}</span></td>`
-          + `<td>${fmt(r.confidence)}</td><td>${cause}</td></tr>`;
+          + `<td>${fmt(r.confidence)}</td><td>${entryDistance(r.symbol)}</td><td>${cause}</td></tr>`;
       }).join("")
-    : `<tr><td colspan="4" class="muted">No strong signals right now (needs confidence ≥ 0.6).</td></tr>`;
+    : `<tr><td colspan="5" class="muted">No strong signals right now (needs confidence ≥ 0.6).</td></tr>`;
 }
 
 function paintNews(rows) {
@@ -454,7 +545,7 @@ document.querySelectorAll(".tab").forEach(tab => {
   tab.addEventListener("click", () => {
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     tab.classList.add("active");
-    ["positions", "realized", "signals", "news", "analysis", "strategies", "trades", "activity", "logs"].forEach(name =>
+    ["positions", "realized", "watchlist", "signals", "news", "analysis", "strategies", "trades", "activity", "logs"].forEach(name =>
       $("tab-" + name).classList.toggle("hidden", name !== tab.dataset.tab));
   });
 });
@@ -525,7 +616,7 @@ $("arm2-toggle").addEventListener("change", async (e) => {
 const SECTION_LABELS = {
   general: "General", loop: "Loop", options: "Options", risk: "Risk",
   economics: "Economics", research: "Research", tr: "Trade Republic",
-  data: "Data", model: "Model",
+  data: "Data", model: "Model", entry: "Watchlist entry",
 };
 
 function fieldInput(f) {

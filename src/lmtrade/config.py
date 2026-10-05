@@ -92,6 +92,9 @@ class EconomicsConfig(BaseModel):
 
 class LoopConfig(BaseModel):
     interval_seconds: int = 60
+    # Re-check exits (TP/SL/trailing) of open positions this often, between
+    # symbol decisions and during the idle wait — quotes for held symbols only.
+    exit_check_seconds: float = 10.0
     max_positions: int = 2
     # Cap new positions opened in a single cycle, independent of how many
     # slots are free — controls "how many trades per hour" alongside the
@@ -139,6 +142,11 @@ class EntryConfig(BaseModel):
     watch_k: float = 1.0           # enter at >= k sigma from the intraday SMA
     watch_window: int = 60         # bars of history for the SMA / std
     watch_max_hours: float = 4.0   # drop the watch entry after this long
+    # Exchange-side entries: a resting limit order at the trigger price instead
+    # of a market order once triggered (core/limit_orders.py). Re-priced when
+    # the target drifts more than reprice_drift (fraction).
+    limit_orders: bool = False
+    reprice_drift: float = 0.005
 
 
 class OptionsConfig(BaseModel):

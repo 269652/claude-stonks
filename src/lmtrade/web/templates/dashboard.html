@@ -73,7 +73,8 @@
                background:var(--panel); border:1px solid var(--line); border-radius:8px;
                padding:6px 9px; font-size:12px; line-height:1.45; white-space:nowrap; }
   .chart-tip .t { color:var(--muted); font-size:11px; }
-  .chart-tip .pos { color:var(--green); } .chart-tip .neg { color:var(--red); }
+  .chart-tip .pos, #watchlist .pos { color:var(--green); }
+  .chart-tip .neg, #watchlist .neg { color:var(--red); }
   .refresh { display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
   .ring { width:18px; height:18px; }
   .ring-progress { animation:ringfill 5s linear infinite; }
@@ -92,6 +93,11 @@
   td.exits { font-size:12px; line-height:1.5; white-space:nowrap; }
   td.exits .pos { color:var(--green); } td.exits .neg { color:var(--red); }
   td.exits .lock { color:var(--green); font-weight:600; }
+  .inline-exit { cursor:pointer; border-bottom:1px dashed var(--line); }
+  .inline-exit:hover { border-bottom-color:var(--blue); color:var(--text); }
+  input.inline-exit-input { width:80px; background:var(--bg); border:1px solid var(--blue);
+             color:var(--text); border-radius:4px; padding:1px 4px; font-size:12px; }
+  input.inline-exit-input.bad { border-color:var(--red); }
   .exits-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
                color:var(--muted); border-radius:6px; padding:1px 8px; font-size:12px;
                margin-top:3px; }
@@ -233,6 +239,7 @@
   <div class="tabs">
     <div class="tab active" data-tab="positions">Positions</div>
     <div class="tab" data-tab="realized">Realized<span id="realized-unread" class="unread hidden"></span></div>
+    <div class="tab" data-tab="watchlist">Watchlist<span id="watch-count" class="muted"></span></div>
     <div class="tab" data-tab="signals">Signals</div>
     <div class="tab" data-tab="news">News</div>
     <div class="tab" data-tab="analysis">Analysis</div>
@@ -243,7 +250,7 @@
   </div>
 
   <section id="tab-positions">
-    <table><thead><tr><th>Symbol</th><th>Type</th><th>ISIN</th><th>Qty</th><th>Avg Price</th><th>Value</th><th>P&amp;L</th><th>Exits</th><th></th></tr></thead>
+    <table><thead><tr><th>Symbol</th><th>Type</th><th>ISIN</th><th>Qty</th><th>Avg Price</th><th>Price</th><th>Value</th><th>P&amp;L</th><th>Exits</th><th></th></tr></thead>
       <tbody id="positions"></tbody></table>
   </section>
 
@@ -252,8 +259,15 @@
       <tbody id="realized-rows"></tbody></table>
   </section>
 
+  <section id="tab-watchlist" class="hidden">
+    <div class="muted" id="watch-note" style="font-size:12px; margin:4px 0 8px;"></div>
+    <table><thead><tr><th>Symbol</th><th>Signal</th><th>Confidence</th><th>Now</th>
+      <th>Enters at</th><th>To go</th><th>Order</th><th>Expires in</th></tr></thead>
+      <tbody id="watchlist"></tbody></table>
+  </section>
+
   <section id="tab-signals" class="hidden">
-    <table><thead><tr><th>Symbol</th><th>Direction</th><th>Confidence</th><th>Cause (contributing signals)</th></tr></thead>
+    <table><thead><tr><th>Symbol</th><th>Direction</th><th>Confidence</th><th>Entry</th><th>Cause (contributing signals)</th></tr></thead>
       <tbody id="signals"></tbody></table>
   </section>
 
@@ -288,6 +302,7 @@
   </section>
 </main>
 <script src="/static/chart.js"></script>
+<script src="/static/exits.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

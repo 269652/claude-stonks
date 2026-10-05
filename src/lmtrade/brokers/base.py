@@ -14,6 +14,7 @@ class OrderResult:
     price: float
     fee: float = 0.0
     message: str = ""
+    order_id: str | None = None   # exchange order id (live limit orders)
 
 
 class Broker:

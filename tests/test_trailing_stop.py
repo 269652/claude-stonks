@@ -204,3 +204,40 @@ class TestPositionRowExits:
         html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
         head = html[html.index("<th>Symbol</th><th>Type</th>"):]
         assert "<th>Exits</th>" in head[:head.index("</tr>")]
+
+
+class TestPositionRowPrice:
+    @pytest.fixture()
+    def client(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        oid = store.open_option("AAPL", "call", strike=100.0,
+                                expiry_ts=time.time() + 5 * 86400, iv=0.4,
+                                contracts=10.0, entry_premium=2.0, genome_id=None)
+        store.set_meta("open_option_marks", {str(oid): {
+            "mark_premium": 4.6, "value": 46.0, "unrealized_pnl": 25.0, "spot": 101.25}})
+        return TestClient(create_app(settings))
+
+    def test_row_has_current_price_and_underlying(self, client):
+        row = client.get("/api/summary").json()["positions"][0]
+        assert row["price"] == pytest.approx(4.6)
+        assert row["spot"] == pytest.approx(101.25)
+
+    def test_unmarked_position_has_no_price(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        store.open_option("AAPL", "call", strike=100.0, expiry_ts=time.time() + 86400,
+                          iv=0.4, contracts=1.0, entry_premium=2.0, genome_id=None)
+        row = TestClient(create_app(settings)).get("/api/summary").json()["positions"][0]
+        assert row["price"] is None and row["spot"] is None
+
+    def test_table_has_price_column(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        head = html[html.index("<th>Symbol</th><th>Type</th>"):]
+        head = head[:head.index("</tr>")]
+        assert "<th>Avg Price</th><th>Price</th>" in head
+        js = (web / "static" / "app.js").read_text(encoding="utf-8")
+        assert "p.spot" in js

@@ -171,4 +171,4 @@ class TestCloseButtonWiring:
         html = self._read("templates", "dashboard.html")
         head = html[html.index("<th>Symbol</th><th>Type</th>"):]
         head = head[:head.index("</tr>")]
-        assert head.count("<th") == 9   # + Exits column
+        assert head.count("<th") == 10   # + Exits and Price columns

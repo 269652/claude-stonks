@@ -144,14 +144,37 @@ class TradeRepublicBroker(Broker):
         resubmitting with warningsShown — the double-arm consent covers that —
         and anything still unconfirmed is a failure with the raw payload
         logged for diagnosis."""
+        # good-for-day market order, no fractional certificates.
+        return self._submit_confirmed(
+            isin, side, size, exchange,
+            lambda api, warnings: api.market_order(isin, exchange, side, size, "gfd", False,
+                                                   warnings_shown=warnings))
+
+    def place_limit_order(self, isin: str, side: str, size: float, limit: float,
+                          exchange: str = DEFAULT_EXCHANGE) -> OrderResult:
+        """Place a REAL good-for-day LIMIT order (exchange-side entry). Same
+        confirmation rules as place_order: armed only, and only counts as
+        placed when TR returns an order id (OrderResult.order_id)."""
+        if size <= 0 or limit <= 0:
+            return OrderResult(False, isin, side, size, limit, 1.0,
+                               f"invalid limit order (size {size}, limit {limit})")
+        price = round(float(limit), 2)
+        return self._submit_confirmed(
+            isin, side, size, exchange,
+            lambda api, warnings: api.limit_order(isin, exchange, side, size, price, "gfd",
+                                                  warnings_shown=warnings),
+            price=price)
+
+    def _submit_confirmed(self, isin: str, side: str, size: float, exchange: str,
+                          make_sub, price: float = 0.0) -> OrderResult:
         if not self.armed:
             return OrderResult(
-                False, isin, side, size, 0.0, 1.0,
+                False, isin, side, size, price, 1.0,
                 "LIVE order blocked: broker not armed. Arm + confirm live "
                 "execution in the dashboard first.")
         api = self._login()
         if api is None:
-            return OrderResult(False, isin, side, size, 0.0, 1.0,
+            return OrderResult(False, isin, side, size, price, 1.0,
                                "LIVE order blocked: TR session unavailable.")
         try:
             import asyncio
@@ -159,10 +182,7 @@ class TradeRepublicBroker(Broker):
             from .tr_derivatives import _recv_for
 
             async def _submit(warnings_shown: list[str] | None) -> Any:
-                # good-for-day market order, no fractional certificates.
-                sub_id = await api.market_order(isin, exchange, side, size,
-                                                "gfd", False,
-                                                warnings_shown=warnings_shown)
+                sub_id = await make_sub(api, warnings_shown)
                 payload = await _recv_for(api, sub_id)
                 await api.unsubscribe(sub_id)
                 return payload
@@ -195,12 +215,93 @@ class TradeRepublicBroker(Broker):
                                    f"TR order unconfirmed (no order id): {payload!r}")
             log.info("LIVE order CONFIRMED %s: %s %s x%s on %s",
                      oid, side, isin, size, exchange)
-            return OrderResult(True, isin, side, size, 0.0, 1.0,
-                               f"live order placed ({oid})")
+            return OrderResult(True, isin, side, size, price, 1.0,
+                               f"live order placed ({oid})", order_id=oid)
         except Exception as exc:  # noqa: BLE001
             log.warning("TR order error (%s %s x%s): %s", side, isin, size, exc)
             return OrderResult(False, isin, side, size, 0.0, 1.0,
                                f"TR order error: {exc}")
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a resting order. False if TR reports an error (e.g. it was
+        already filled or is unknown) or the session is down."""
+        api = self._login()
+        if api is None:
+            return False
+        try:
+            import asyncio
+
+            from .tr_derivatives import _recv_for
+
+            async def _cancel() -> Any:
+                sub_id = await api.cancel_order(order_id)
+                payload = await _recv_for(api, sub_id)
+                await api.unsubscribe(sub_id)
+                return payload
+
+            payload = asyncio.get_event_loop().run_until_complete(_cancel())
+            if isinstance(payload, dict) and payload.get("errors"):
+                log.warning("TR cancel %s rejected: %s", order_id, payload["errors"])
+                return False
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("TR cancel %s error: %s", order_id, exc)
+            return False
+
+    def order_status(self, order_id: str) -> dict | None:
+        """{"state": "open"|"filled"|"gone", "fill_price": float|None} for an
+        order, from TR's orders overview. None when unknown (session down,
+        order not listed, unrecognised payload) — callers must then NOT
+        assume a fill. The overview's exact shape is unverified against the
+        real API, so parsing is defensive."""
+        api = self._login()
+        if api is None:
+            return None
+        try:
+            import asyncio
+
+            from .tr_derivatives import _recv_for
+
+            async def _query() -> Any:
+                sub_id = await api.order_overview()
+                payload = await _recv_for(api, sub_id)
+                await api.unsubscribe(sub_id)
+                return payload
+
+            payload = asyncio.get_event_loop().run_until_complete(_query())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("TR order overview error: %s", exc)
+            return None
+        return self._parse_order_status(payload, order_id)
+
+    @staticmethod
+    def _parse_order_status(payload: Any, order_id: str) -> dict | None:
+        orders = payload.get("orders") if isinstance(payload, dict) else payload
+        if not isinstance(orders, list):
+            return None
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            if str(o.get("id") or o.get("orderId") or "") != str(order_id):
+                continue
+            raw = str(o.get("status") or o.get("state") or "").lower()
+            fill = None
+            for key in ("averagePrice", "avgPrice", "executionPrice", "price"):
+                try:
+                    if o.get(key) is not None:
+                        fill = float(o[key])
+                        break
+                except (TypeError, ValueError):
+                    continue
+            if any(w in raw for w in ("execut", "fill", "done", "complete")):
+                return {"state": "filled", "fill_price": fill}
+            if any(w in raw for w in ("cancel", "expir", "reject", "delet")):
+                return {"state": "gone", "fill_price": None}
+            if any(w in raw for w in ("open", "pending", "active", "new", "work")):
+                return {"state": "open", "fill_price": None}
+            log.warning("TR order %s has unrecognised status %r", order_id, raw)
+            return None
+        return None
 
     def buy(self, symbol: str, qty: float, price: float) -> OrderResult:
         # Equity-by-ticker isn't the bot's live path (it trades knockouts by

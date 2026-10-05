@@ -95,6 +95,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return _books["paper"]
         return store_for(c.mode)
 
+    def view_book() -> Store:
+        """The book behind the money figures the user sees: in LIVE view the
+        live book (real TR account) even while unarmed — never the paper
+        book the engine trades meanwhile."""
+        return store_for("live") if control().mode == "live" else store()
+
     if STATIC.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
@@ -114,7 +120,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # which on Windows is cp1252 and mangles the template's ⚡/· glyphs
         # into mojibake (âš¡ / Â·) before they're ever served.
         html = (TEMPLATES / "dashboard.html").read_text(encoding="utf-8")
-        for name in ("chart.js", "app.js"):
+        for name in ("chart.js", "exits.js", "app.js"):
             html = html.replace(f"/static/{name}",
                                 f"/static/{name}?v={_asset_version(name)}")
         return html
@@ -128,9 +134,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/summary")
     def summary() -> JSONResponse:
-        is_live = control().mode == "live"
-        equity_positions = store().positions()
-        open_opts = store().open_options()
+        ctrl = control()
+        is_live = ctrl.mode == "live"
+        # LIVE view = real money only: positions always come from the live book
+        # (which mirrors the TR account), never the paper book the engine
+        # trades while live is unarmed. Unarmed, the engine isn't driving that
+        # book, so its rows get no close / exit-edit handles.
+        book = view_book()
+        can_act = not is_live or ctrl.armed
+        equity_positions = book.positions()
+        open_opts = book.open_options()
         tr_cash = _tr_meta("tr_account_cash")
         # LIVE view: cash is the REAL TR balance (None until fetched) — never
         # default an empty live book to the paper budget, which fabricated a
@@ -146,7 +159,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if is_live and cash is not None:
             # Real live: equity = TR cash + unrealized P&L on open positions
             positions_value = sum(
-                (m.get("value") or 0.0) for m in store().get_meta("open_option_marks", {}).values()
+                (m.get("value") or 0.0) for m in book.get_meta("open_option_marks", {}).values()
             )
             equity = cash + positions_value
         else:
@@ -157,17 +170,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # omitted, so an options-only book (the common case) showed "0
         # positions" even when full. For an option, qty=contracts and
         # avg_price=entry premium; the real TR ISIN is surfaced when present.
-        marks = store().get_meta("open_option_marks", {}) or {}
-        pending = store().get_meta("close_requests") or []
+        marks = book.get_meta("open_option_marks", {}) or {}
+        pending = book.get_meta("close_requests") or []
         rows = [
             {"symbol": p.symbol, "qty": round(p.qty, 6),
              "avg_price": round(p.avg_price, 4), "kind": "equity", "isin": None,
-             "value": None, "unrealized_pnl": None,
-             "id": None, "close_kind": "equity", "close_symbol": p.symbol,
+             "value": None, "unrealized_pnl": None, "price": None, "spot": None,
+             "id": None, "close_kind": "equity" if can_act else None,
+             "close_symbol": p.symbol,
              "close_pending": {"kind": "equity", "symbol": p.symbol} in pending}
             for p in equity_positions
         ]
-        overrides = store().get_meta("exit_overrides") or {}
+        overrides = book.get_meta("exit_overrides") or {}
         for o in open_opts:
             kind = o.get("instrument_type") or "option"
             entry, n = o.get("entry_premium", 0.0), o.get("contracts", 0.0)
@@ -195,6 +209,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "isin": o.get("isin"),
                 "value": mark.get("value") if mark else None,
                 "unrealized_pnl": mark.get("unrealized_pnl") if mark else None,
+                # Current premium per unit (what the P&L is marked at) and the
+                # underlying's price, from the engine's latest mark.
+                "price": mark.get("mark_premium") if mark else None,
+                "spot": mark.get("spot") if mark else None,
                 "tp_price": rnd(plan.tp), "tp_pnl": net_if(plan.tp),
                 "sl_price": rnd(plan.sl), "sl_pnl": net_if(plan.sl),
                 "trail": {
@@ -206,7 +224,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "peak_pnl": mark.get("peak_pnl") if mark and plan.trail_enabled else None,
                 },
                 "exits_custom": plan.custom,
-                "id": o.get("id"), "close_kind": "option", "close_symbol": None,
+                "id": o.get("id"), "close_kind": "option" if can_act else None,
+                "close_symbol": None,
                 "close_pending": {"kind": "option", "id": o.get("id")} in pending,
             })
         return SafeJSONResponse({
@@ -251,7 +270,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def realized(limit: int = 100) -> JSONResponse:
         """Closed options/knockouts with realized P&L, plus running totals —
         the counterpart to the open positions' unrealized P&L."""
-        closed = store().closed_options(limit)
+        closed = view_book().closed_options(limit)   # real money only in LIVE view
         rows = []
         total = wins = losses = 0.0
         for o in closed:
@@ -314,6 +333,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def analysis() -> JSONResponse:
         """The latest compiled daily market analysis (per-symbol bias)."""
         return SafeJSONResponse(store().get_meta("market_analysis", {}) or {})
+
+    @app.get("/api/watchlist")
+    def watchlist() -> JSONResponse:
+        """Signals waiting for a better entry (core/watchlist.py): current
+        stretch from the intraday SMA in sigma, the trigger, how far is left
+        to go, and when the entry expires."""
+        cfg = settings.entry
+        rows = []
+        pend = store().get_meta("pending_entries") or {}
+        for sym, w in (store().get_meta("watchlist") or {}).items():
+            direction = w.get("direction")
+            trigger = -cfg.watch_k if direction == "buy" else cfg.watch_k
+            z = w.get("z")
+            to_go = None
+            if z is not None:
+                to_go = max(0.0, z - trigger) if direction == "buy" else max(0.0, trigger - z)
+            added = float(w.get("added_ts") or 0.0)
+            rows.append({
+                "symbol": sym, "direction": direction,
+                "instrument": "call" if direction == "buy" else "put",
+                "confidence": w.get("confidence"), "z": z, "k": cfg.watch_k,
+                "trigger_z": trigger,
+                "sigma_to_go": None if to_go is None else round(to_go, 4),
+                "added_ts": added, "expires_ts": added + cfg.watch_max_hours * 3600,
+                "checked_ts": w.get("checked_ts"),
+                "order": ({k: pend[sym].get(k) for k in
+                           ("limit", "size", "target_spot", "order_id", "placed_ts")}
+                          | {"kind": pend[sym]["instrument"]["kind"]}
+                          if sym in pend else None),
+            })
+        # Closest to its entry first; not-yet-measured entries last.
+        rows.sort(key=lambda r: (r["sigma_to_go"] is None, r["sigma_to_go"] or 0.0,
+                                 -(r["confidence"] or 0)))
+        return SafeJSONResponse(rows)
 
     @app.get("/api/signals")
     def signals(min_confidence: float = 0.6, limit: int = 200) -> JSONResponse:

@@ -60,6 +60,7 @@ loop:
                            # can't do true HFT; sub-second execution is
                            # impossible via its API). Override with
                            # `lmtrade run --interval N` or config.toml.
+  exit_check_seconds: 10   # re-check TP/SL/trailing of open positions this often
   max_positions: 8         # cap concurrent open positions — deliberately far
                            # below universe size; slots go to the strongest
                            # ranked signals across the whole universe each
@@ -108,6 +109,8 @@ entry:                     # watch-list entry timing (core/watchlist.py)
   watch_k: 1.0             # enter at >= 1 sigma below (buy) / above (sell) the intraday SMA
   watch_window: 60         # bars used for that SMA / std (1m bars intraday)
   watch_max_hours: 4.0     # drop the watch entry if no good entry comes within this time
+  limit_orders: true       # rest a limit order at the trigger price (exchange-side entry)
+  reprice_drift: 0.005     # re-price the resting order when its target moves > 0.5%
 
 learning:                  # evolutionary strategy optimizer
   enabled: true

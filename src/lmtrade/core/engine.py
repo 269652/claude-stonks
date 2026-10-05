@@ -45,6 +45,7 @@ from .events import EventBus
 from .scheduler import Scheduler
 from .state import Store, Trade
 from .exits import exit_plan
+from .limit_orders import needs_reprice, target_spot
 from .watchlist import entry_z, should_enter
 
 OPTION_FEE = 1.0   # per option/knockout order: TR's flat 1 EUR fee, charged on
@@ -95,6 +96,8 @@ class Engine:
         self._stop = False
         self._close_wait_logged: set[tuple[str, str]] = set()   # manual-close retry notices
         self._exit_retry_at: dict[int, float] = {}   # option id -> next live-exit attempt
+        self._last_exit_check = 0.0     # wall clock of the last fast exit check
+        self._fast_exit_checks = 0
         store.set_meta("mode", broker.mode)
         store.set_meta("universe", settings.universe)
 
@@ -517,6 +520,34 @@ class Engine:
         self.store.set_meta("close_requests", [r for r in current if r not in handled])
         return closed
 
+    def _check_exits_fast(self) -> None:
+        """Exit check between full cycles: fresh quotes for the symbols we
+        hold, then the normal exit ladder (TP/SL/trailing/knock-out). A full
+        cycle takes minutes; without this a trailing stop could be overshot
+        by whatever the price did in between."""
+        now = time.time()
+        if now - self._last_exit_check < self.settings.loop.exit_check_seconds:
+            return
+        self._last_exit_check = now
+        held = {o["underlying"] for o in self.store.open_options()}
+        if not held:
+            return
+        self._fast_exit_checks += 1
+        prices: dict[str, float] = {}
+        tradeable: set[str] = set()
+        for symbol in held:
+            try:
+                q = self.market.quote(symbol)
+            except Exception:  # noqa: BLE001 — a failed quote just skips this check
+                continue
+            if self._is_trustworthy(q):
+                prices[symbol] = q.price
+                self._last_good_price[symbol] = q.price
+                tradeable.add(symbol)
+        if tradeable:
+            self._manage_options(prices, tradeable)
+            self._persist_option_marks(prices)
+
     def _poll_close_requests(self) -> None:
         if self.store.get_meta("close_requests"):
             self.process_close_requests()
@@ -530,6 +561,7 @@ class Engine:
                 break
             time.sleep(min(1.0, remaining))
             self._poll_close_requests()
+            self._check_exits_fast()
 
     def _record_learning(self, genome_id: str | None, pnl: float) -> None:
         if not (self.optimizer and genome_id):
@@ -643,6 +675,13 @@ class Engine:
         # (1 - cash_reserve_pct) * equity.  Already-deployed capital is
         # subtracted first; the remainder is available for this new position.
         deployed = positions_value + options_value
+        # Resting limit entries reserve capital (TR blocks the cash too) —
+        # except this symbol's own order, which is what's being (re)sized.
+        reserved = sum(float(p.get("notional", 0.0)) + OPTION_FEE
+                       for s, p in (self.store.get_meta("pending_entries") or {}).items()
+                       if s != quote.symbol)
+        deployed += reserved
+        cash -= reserved
         max_deployable = equity * (1.0 - cfg.cash_reserve_pct)
         available = max(0.0, max_deployable - deployed)
 
@@ -690,13 +729,16 @@ class Engine:
             if entry is None or entry["direction"] != decision.direction:
                 wl[sym] = {"direction": decision.direction,
                            "confidence": round(decision.confidence, 3),
-                           "added_ts": now}
+                           "added_ts": now, "genome_id": genome_id}
                 self.bus.info(
                     f"[watch] {sym}: {decision.direction.upper()} conf "
                     f"{decision.confidence:.2f} watching — enter at >={cfg.watch_k:g}σ "
                     f"{side} intraday SMA (now {z_txt})", source="engine")
             else:
                 entry["confidence"] = round(decision.confidence, 3)
+            # For the dashboard's Watchlist tab: where price is right now.
+            wl[sym]["z"] = None if z is None else round(z, 4)
+            wl[sym]["checked_ts"] = now
             if should_enter(decision.direction, z, cfg.watch_k):
                 self.bus.info(f"[watch] {sym}: {decision.direction.upper()} triggered "
                               f"at {z_txt}", source="engine")
@@ -705,6 +747,210 @@ class Engine:
         self.store.set_meta("watchlist", wl)
         self.store.set_meta("watchlist_expired", expired)
         return triggered
+
+    # ------------------------------------------------- exchange-side entries
+    def _instrument_price(self, inst: dict, spot: float) -> float:
+        """Model price of an instrument (option / knockout) at `spot`."""
+        pseudo = {**inst, "opened_ts": self.now(), "entry_premium": 0.0, "contracts": 0.0}
+        return self._mark_position(pseudo, spot)
+
+    def _select_instrument(self, quote: Quote, direction: str, armed: bool) -> dict | None:
+        """Real TR knockout when the TR client is up; synthetic option only
+        when NOT armed live (a synthetic order can't rest on an exchange)."""
+        tr = self.tr_derivatives
+        if tr is not None and tr.available():
+            ko = tr.find_knockout(quote.symbol, direction, quote.price,
+                                  self.settings.tr.target_leverage)
+            if ko is not None and ko.price > 0:
+                return {"instrument_type": "knockout", "kind": ko.kind, "strike": ko.strike,
+                        "barrier": ko.barrier, "ratio": ko.ratio, "isin": ko.isin,
+                        "expiry_ts": self.now() + 365 * 86400.0, "iv": 0.0}
+        if armed:
+            return None
+        kind = "call" if direction == "buy" else "put"
+        oq = synth_option(quote.symbol, quote.price, quote.history, kind,
+                          expiry_days=self.settings.options.expiry_days)
+        return {"instrument_type": "option", "kind": kind, "strike": oq.strike,
+                "barrier": None, "ratio": None, "isin": None,
+                "expiry_ts": oq.expiry_ts, "iv": oq.iv}
+
+    def _place_limit_entry(self, sym: str, w: dict, quote: Quote, armed: bool) -> dict | None:
+        cfg = self.settings.entry
+        direction = w["direction"]
+        tgt = target_spot(quote.history, cfg.watch_window, cfg.watch_k, direction)
+        if tgt is None:
+            return None
+        inst = self._select_instrument(quote, direction, armed)
+        if inst is None:
+            self.bus.info(f"[limit] {sym}: no tradeable instrument for a resting order",
+                          source="engine")
+            return None
+        limit = self._instrument_price(inst, tgt)
+        if limit <= 0:
+            return None
+        decision = Decision(sym, direction, float(w.get("confidence") or 0.0),
+                            "watch-list limit entry")
+        budget = self._position_budget(quote, decision, w.get("genome_id"))
+        if budget <= 0.05:
+            return None
+        size = budget / limit
+        order_id = None
+        if armed:
+            size = float(int(size))   # whole certificates
+            if size < 1 or not fee_ratio_ok(size * limit, OPTION_FEE,
+                                            self.settings.risk.max_fee_pct):
+                self.bus.info(f"[limit] {sym}: whole-certificate size misses the fee "
+                              f"minimum — no order", source="engine")
+                return None
+            from .control import ControlState
+            if ControlState.load(self.settings.control_path).low_balance_blocks(
+                    self.broker.cash()):
+                self.bus.warn(f"LIVE limit order blocked [{inst['isin']}]: balance under "
+                              f"€{LOW_BALANCE_EUR:.0f} and the low-balance guard is not armed.",
+                              source="engine")
+                return None
+            res = self.broker.place_limit_order(inst["isin"], "buy", size, limit)
+            if not res.ok:
+                self.bus.warn(f"LIVE limit order rejected [{inst['isin']}]: {res.message}",
+                              source="engine")
+                return None
+            order_id, limit = res.order_id, (res.price or limit)
+        side = "below" if direction == "buy" else "above"
+        self.bus.info(
+            f"[limit] {sym}: {direction.upper()} {inst['kind']} resting limit "
+            f"×{size:.3f} @ {limit:.3f} — fills when {sym} reaches {tgt:.2f} "
+            f"({cfg.watch_k:g}σ {side} intraday SMA)", source="engine")
+        return {"direction": direction, "confidence": w.get("confidence"),
+                "genome_id": w.get("genome_id"), "instrument": inst, "limit": limit,
+                "size": size, "notional": size * limit, "target_spot": tgt,
+                "placed_ts": self.now(), "order_id": order_id}
+
+    def _book_limit_fill(self, sym: str, p: dict, price: float) -> None:
+        inst, contracts = p["instrument"], float(p["size"])
+        if not self._live_armed():
+            if not self.broker.adjust_cash(-(contracts * price + OPTION_FEE)):
+                self.bus.warn(f"[limit] {sym}: fill needs more cash than available — "
+                              f"not booked", source="engine")
+                return
+        self.store.record_cost("fee", OPTION_FEE, "options")
+        cfg = self.settings.options
+        self.store.open_option(
+            sym, inst["kind"], inst["strike"], inst["expiry_ts"], inst.get("iv") or 0.0,
+            contracts, price, p.get("genome_id"),
+            tp_premium=price * (1 + cfg.take_profit_pct),
+            sl_premium=price * (1 - cfg.stop_loss_pct),
+            instrument_type=inst["instrument_type"], barrier=inst.get("barrier"),
+            ratio=inst.get("ratio"), isin=inst.get("isin"))
+        self.store.record_trade(Trade(
+            sym, "buy", contracts, price, OPTION_FEE, self.broker.mode,
+            f"limit fill {inst['kind']} {inst.get('isin') or 'synthetic'} — watch-list entry",
+            p.get("confidence")))
+        self.bus.activity("trade", f"LIMIT FILL {inst['kind'].upper()} {sym} "
+                                   f"×{contracts:.3f} @ {price:.3f}", sym)
+
+    def _drop_pending(self, sym: str, p: dict, why: str) -> bool:
+        """Cancel a resting order. Returns False when it must stay tracked
+        (live cancel failed and TR doesn't confirm it's gone)."""
+        oid = p.get("order_id")
+        if self._live_armed() and oid:
+            if not self.broker.cancel_order(oid):
+                st = self.broker.order_status(oid)
+                if st and st["state"] == "filled":
+                    self._book_limit_fill(sym, p, st.get("fill_price") or p["limit"])
+                    return True
+                if st is None or st["state"] == "open":
+                    self.bus.warn(f"[limit] {sym}: could not cancel order {oid} — "
+                                  f"still tracking it", source="engine")
+                    return False
+        self.bus.info(f"[limit] {sym}: order cancelled — {why}", source="engine")
+        return True
+
+    def _manage_limit_entries(self, quotes: dict[str, Quote], tradeable: set[str],
+                              econ) -> None:
+        """Lifecycle of resting limit entries: fills -> positions, cancels when
+        the watch entry is gone, re-pricing on drift, and new orders for the
+        watched signals closest to their entry while capital and slots last."""
+        cfg = self.settings.entry
+        armed = self._live_armed()
+        wl: dict = self.store.get_meta("watchlist") or {}
+        pend: dict = self.store.get_meta("pending_entries") or {}
+
+        for sym, p in list(pend.items()):
+            w = wl.get(sym)
+            if w is None or w.get("direction") != p["direction"]:
+                if self._drop_pending(sym, p, "signal gone or watch expired"):
+                    pend.pop(sym)
+                continue
+            quote = quotes.get(sym)
+            if armed:
+                st = self.broker.order_status(p["order_id"]) if p.get("order_id") else None
+                if st is None:
+                    continue                      # unknown: never assume a fill
+                if st["state"] == "filled":
+                    self._book_limit_fill(sym, p, st.get("fill_price") or p["limit"])
+                    pend.pop(sym)
+                    continue
+                if st["state"] == "gone":
+                    pend.pop(sym)                 # expired at TR: may be re-placed
+                    continue
+            elif quote is not None and sym in tradeable:
+                now_price = self._instrument_price(p["instrument"], quote.price)
+                if 0 < now_price <= p["limit"]:   # buy limit: fills at or below
+                    self._book_limit_fill(sym, p, now_price)
+                    pend.pop(sym)
+                    continue
+            if quote is None or sym not in tradeable:
+                continue
+            tgt = target_spot(quote.history, cfg.watch_window, cfg.watch_k, p["direction"])
+            if tgt is None:
+                continue
+            new_limit = self._instrument_price(p["instrument"], tgt)
+            if new_limit <= 0 or not needs_reprice(p["limit"], new_limit, cfg.reprice_drift):
+                continue
+            if armed:
+                if not self._drop_pending(sym, p, "re-pricing"):
+                    continue
+                if not self.store.open_options() or all(
+                        o["underlying"] != sym for o in self.store.open_options()):
+                    res = self.broker.place_limit_order(p["instrument"]["isin"], "buy",
+                                                        p["size"], new_limit)
+                    if not res.ok:
+                        self.bus.warn(f"[limit] {sym}: re-placing failed — {res.message}",
+                                      source="engine")
+                        pend.pop(sym)
+                        continue
+                    p["order_id"], new_limit = res.order_id, (res.price or new_limit)
+                else:
+                    pend.pop(sym)                 # filled while re-pricing
+                    continue
+            self.bus.info(f"[limit] {sym}: re-priced {p['limit']:.3f} → {new_limit:.3f} "
+                          f"(target {tgt:.2f})", source="engine")
+            p.update(limit=new_limit, notional=p["size"] * new_limit, target_spot=tgt)
+        self.store.set_meta("pending_entries", pend)
+
+        held = {o["underlying"] for o in self.store.open_options()}
+        held |= {pos.symbol for pos in self.store.positions()}
+        free = self.settings.loop.max_positions - len(held) - len(pend)
+        k = cfg.watch_k
+
+        def to_go(w: dict) -> float:
+            z = w.get("z")
+            if z is None:
+                return float("inf")
+            return max(0.0, z + k) if w["direction"] == "buy" else max(0.0, k - z)
+
+        waiting = sorted(((s, w) for s, w in wl.items()
+                          if s not in pend and s not in held and s in tradeable and s in quotes),
+                         key=lambda sw: to_go(sw[1]))
+        for sym, w in waiting:
+            if free <= 0:
+                break
+            order = self._place_limit_entry(sym, w, quotes[sym], armed)
+            if order is not None:
+                pend[sym] = order
+                self.store.set_meta("pending_entries", pend)   # reserve before sizing the next
+                free -= 1
+        self.store.set_meta("pending_entries", pend)
 
     def _prune_watchlist_entered(self) -> None:
         """Drop watch entries for symbols that now hold a position."""
@@ -1012,6 +1258,7 @@ class Engine:
             candidates: list[tuple[Decision, str | None]] = []
             evaluated: set[str] = set()   # symbols whose signal was re-read this cycle
             for symbol in self.settings.universe:
+                self._check_exits_fast()      # keep exits responsive mid-cycle
                 if slots <= 0:
                     break
                 if symbol not in tradeable:
@@ -1042,6 +1289,11 @@ class Engine:
 
             if self.settings.entry.watch_enabled:
                 candidates = self._watchlist_triggers(candidates, evaluated, quotes)
+                if self.settings.entry.limit_orders:
+                    # Exchange-side entries: resting limit orders instead of
+                    # market orders on trigger (TP / SL exits stay market).
+                    self._manage_limit_entries(quotes, tradeable, econ)
+                    candidates = []
 
             # Rank by confidence so limited slots go to the strongest signals
             # across the whole universe, not just whichever symbols happened
