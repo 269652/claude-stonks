@@ -39,6 +39,7 @@ def settings(tmp_path: Path) -> Settings:
     s.risk.min_confidence = 1.1
     s.options.enabled = True
     s.learning.enabled = False
+    s.risk.max_fee_pct = 0.0   # these tests are about slot caps, not fee drag
     return s
 
 

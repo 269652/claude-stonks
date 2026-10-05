@@ -48,6 +48,7 @@ def settings(tmp_path: Path) -> Settings:
     s.data_dir = tmp_path
     s.loop.interval_seconds = 1
     s.risk.min_confidence = 0.5
+    s.risk.max_fee_pct = 0.0   # fee guard has its own tests (test_fee_guard.py)
     s.options.enabled = True
     s.learning.enabled = False
     s.tr.use_derivatives = True

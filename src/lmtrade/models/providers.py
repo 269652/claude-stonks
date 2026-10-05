@@ -10,6 +10,7 @@ signal when their key/host is missing, so the stack never blocks the loop.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -196,7 +197,8 @@ class CloudLLMProvider(ModelProvider):
             return Signal(self.name, "hold", 0.5, f"cloud error: {exc}", 0.0)
 
 
-def _default_claude_cli_runner(prompt: str, timeout: float = CLAUDE_CLI_TIMEOUT) -> str:
+def _default_claude_cli_runner(prompt: str, timeout: float = CLAUDE_CLI_TIMEOUT,
+                               model: str | None = None) -> str:
     """Run a prompt through the locally-installed Claude Code CLI in
     non-interactive print mode and return its stdout.
 
@@ -218,6 +220,8 @@ def _default_claude_cli_runner(prompt: str, timeout: float = CLAUDE_CLI_TIMEOUT)
     just the model's static training-cutoff knowledge."""
     exe = shutil.which(CLAUDE_CLI_BIN) or CLAUDE_CLI_BIN
     args = ["-p", "--output-format", "text", "--allowedTools", "WebSearch"]
+    if model:
+        args += ["--model", model]
     if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
         cmd = ["cmd", "/c", exe, *args]
     else:
@@ -244,10 +248,13 @@ class ClaudeCLIProvider(ModelProvider):
     name = "claude_cli"
 
     def __init__(self, settings: Settings | None = None,
-                 runner: Callable[[str, float], str] | None = None):
+                 runner: Callable[[str, float], str] | None = None,
+                 model: str | None = None):
         self.timeout = (settings.research.claude_cli_timeout_seconds
                         if settings is not None else CLAUDE_CLI_TIMEOUT)
-        self._runner = runner or _default_claude_cli_runner
+        self._runner = runner or (
+            functools.partial(_default_claude_cli_runner, model=model)
+            if model else _default_claude_cli_runner)
 
     def available(self) -> bool:
         return shutil.which(CLAUDE_CLI_BIN) is not None

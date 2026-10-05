@@ -30,7 +30,10 @@ from ..finance.knockouts import (
     strike_after_financing,
 )
 from ..finance.options import mark_option, synth_option
-from ..finance.risk import should_exit, size_position
+from ..finance.risk import (
+    fee_aware_budget, fee_ratio_ok, min_notional_for_fee, should_exit, size_position,
+    trailing_exit,
+)
 from ..finance.sizing import kelly_fraction, regime, vol_scale
 from ..models.base import Signal
 from ..models.providers import build_providers
@@ -41,10 +44,13 @@ from .control import LOW_BALANCE_EUR
 from .events import EventBus
 from .scheduler import Scheduler
 from .state import Store, Trade
+from .exits import exit_plan
+from .watchlist import entry_z, should_enter
 
-OPTION_FEE = 0.1   # per option order (paper): smaller than TR's equity fee,
-                   # comparable to warrant spreads on tiny notionals
+OPTION_FEE = 1.0   # per option/knockout order: TR's flat 1 EUR fee, charged on
+                   # entry AND exit and included in every P&L figure
 NEWS_MAX_AGE_S = 24 * 3600   # news older than this no longer influences decisions
+LIVE_EXIT_RETRY_S = 5 * 60   # after a rejected live sell, retry automatic exits this often
 ANALYSIS_RETRY_S = 15 * 60   # when analysis is missing/unusable, retry this often
                              # (not every cycle) so a provider outage doesn't hammer
 
@@ -87,6 +93,8 @@ class Engine:
         )
         self._closed_since_evolve = 0
         self._stop = False
+        self._close_wait_logged: set[tuple[str, str]] = set()   # manual-close retry notices
+        self._exit_retry_at: dict[int, float] = {}   # option id -> next live-exit attempt
         store.set_meta("mode", broker.mode)
         store.set_meta("universe", settings.universe)
 
@@ -134,7 +142,11 @@ class Engine:
         dashboard can show live profit/loss (it's read-only over the Store and
         has no market feed of its own). Keyed by option id as a string."""
         marks: dict[str, dict] = {}
+        cfg = self.settings.options
+        peaks: dict = self.store.get_meta("trail_peaks") or {}
+        overrides: dict = self.store.get_meta("exit_overrides") or {}
         for o in self.store.open_options():
+            plan = exit_plan(o, cfg, overrides.get(str(o["id"])), OPTION_FEE)
             spot = prices.get(o["underlying"])
             # Fall back to last-known price if no fresh quote this cycle
             if spot is None:
@@ -144,11 +156,20 @@ class Engine:
             mark = self._mark_position(o, spot)
             value = o["contracts"] * mark
             cost = o["contracts"] * o["entry_premium"]
+            peak = peaks.get(str(o["id"])) if plan.trail_enabled else None
+            active, stop = False, None
+            if peak is not None:
+                net = value - cost - 2 * OPTION_FEE
+                active, stop, _ = trailing_exit(float(peak), net, plan.trail_min,
+                                                plan.trail_pct)
             marks[str(o["id"])] = {
                 "mark_premium": round(mark, 4),
                 "value": round(value, 4),
-                "unrealized_pnl": round(value - cost, 4),
+                "unrealized_pnl": round(value - cost - OPTION_FEE, 4),   # net of entry fee
                 "spot": round(spot, 4),
+                "peak_pnl": None if peak is None else round(float(peak), 4),
+                "trail_active": active,
+                "trail_stop_pnl": None if stop is None else round(stop, 4),
             }
         self.store.set_meta("open_option_marks", marks)
 
@@ -273,6 +294,8 @@ class Engine:
     # ------------------------------------------------------------ option exits
     def _manage_options(self, prices: dict[str, float], tradeable: set[str]) -> None:
         cfg = self.settings.options
+        peaks: dict = self.store.get_meta("trail_peaks") or {}
+        overrides: dict = self.store.get_meta("exit_overrides") or {}
         for o in self.store.open_options():
             underlying = o["underlying"]
             if underlying not in tradeable:
@@ -286,13 +309,10 @@ class Engine:
             change = (mark - entry) / entry
             hours_left = (o["expiry_ts"] - self.now()) / 3600.0
             hours_held = (self.now() - o["opened_ts"]) / 3600.0
-            # Every position carries explicit TP/SL levels set at open time —
-            # those govern. Config-derived thresholds are only a fallback for
-            # legacy rows persisted before stops were stored per-position.
-            tp = o.get("tp_premium") or entry * (1 + cfg.take_profit_pct)
-            sl = o.get("sl_premium")
-            if sl is None:
-                sl = entry * (1 - cfg.stop_loss_pct)
+            # Effective exits: the position's own stops (set at open), or the
+            # per-position override saved from the dashboard (core/exits.py).
+            plan = exit_plan(o, cfg, overrides.get(str(o["id"])), OPTION_FEE)
+            tp, sl = plan.tp, plan.sl
 
             expiry_hit = hours_left <= cfg.min_hours_to_expiry
             held_long_enough = hours_held >= cfg.min_hold_hours
@@ -309,35 +329,26 @@ class Engine:
                 reason = f"expiry window ({hours_left:.1f}h left)"
             elif cfg.max_hold_hours > 0 and hours_held >= cfg.max_hold_hours:
                 reason = f"max hold time reached ({hours_held:.1f}h)"
-            elif held_long_enough and mark >= tp:
+            elif held_long_enough and tp is not None and mark >= tp:
                 reason = f"take-profit hit (mark {mark:.3f} >= TP {tp:.3f}, {change:+.0%})"
-            elif held_long_enough and mark <= sl:
+            elif held_long_enough and sl is not None and mark <= sl:
                 reason = f"stop-loss hit (mark {mark:.3f} <= SL {sl:.3f}, {change:+.0%})"
+            if plan.trail_enabled and not (is_ko and mark == 0.0):
+                net = (mark - entry) * o["contracts"] - 2 * OPTION_FEE   # if closed now
+                key = str(o["id"])
+                peak = max(float(peaks.get(key, net)), net)
+                peaks[key] = peak
+                _, stop, hit = trailing_exit(peak, net, plan.trail_min, plan.trail_pct)
+                if reason is None and hit and held_long_enough:
+                    reason = (f"trailing take-profit (peak {peak:+.2f} €, now {net:+.2f} €, "
+                              f"stop {stop:+.2f} €)")
             if reason is None:
                 continue
-            proceeds = mark * o["contracts"] - OPTION_FEE
-            pnl = (mark - entry) * o["contracts"] - OPTION_FEE
-            self.broker.adjust_cash(max(0.0, proceeds))
-            self.store.record_cost("fee", OPTION_FEE, "options")
-            self.store.close_option(o["id"], mark, pnl)
+            knocked = reason.startswith("KNOCKED OUT")
+            self._exit_option(o, mark, reason, live_order=not knocked)
 
-            # Profit stash: a configured fraction of realized PROFIT (never
-            # losses) is moved out of tradeable cash into a reserve. Still
-            # counted in net worth/alpha — just protected from being re-risked.
-            stash_pct = self.settings.economics.profit_stash_pct
-            if pnl > 0 and stash_pct > 0:
-                stash = pnl * stash_pct
-                if self.broker.adjust_cash(-stash):
-                    self.store.add_reserve(stash)
-
-            self.store.record_trade(Trade(
-                o["underlying"], "sell", o["contracts"], mark, OPTION_FEE,
-                self.broker.mode, f"close {o['kind']} — {reason}", None))
-            self.bus.activity(
-                "trade",
-                f"CLOSE {o['kind'].upper()} {o['underlying']} pnl {pnl:+.3f} — {reason}",
-                o["underlying"], {"pnl": pnl})
-            self._record_learning(o.get("genome_id"), pnl)
+        open_ids = {str(o["id"]) for o in self.store.open_options()}
+        self.store.set_meta("trail_peaks", {k: v for k, v in peaks.items() if k in open_ids})
 
         # Stale eviction: close positions that have been sideways for too long
         # to free a slot for a stronger incoming signal.  Runs after the normal
@@ -362,29 +373,163 @@ class Engine:
                 pnl_pct = (mark - entry) / entry
                 if pnl_pct >= max_profit:
                     continue   # winning position — don't evict
-                contracts = float(o["contracts"])
-                pnl = (mark - entry) * contracts - OPTION_FEE
-                proceeds = max(0.0, mark * contracts - OPTION_FEE)
-                self.broker.adjust_cash(proceeds)
-                self.store.record_cost("fee", OPTION_FEE, "options")
-                self.store.close_option(o["id"], mark, pnl)
-                stash_pct = self.settings.economics.profit_stash_pct
-                if pnl > 0 and stash_pct > 0:
-                    stash = pnl * stash_pct
-                    if self.broker.adjust_cash(-stash):
-                        self.store.add_reserve(stash)
+                self._exit_option(
+                    o, mark,
+                    f"stale ({age_h:.0f}h, {pnl_pct:+.1%}): freeing slot for stronger signal",
+                    label="STALE CLOSE")
+
+    def _live_armed(self) -> bool:
+        return bool(getattr(self.broker, "armed", False)) and hasattr(self.broker, "place_order")
+
+    def _exit_option(self, o: dict, mark: float, reason: str, label: str = "CLOSE",
+                     live_order: bool = True, manual: bool = False) -> bool:
+        """Close a position. In ARMED live mode a real TR sell order for the
+        certificate's ISIN goes out first, and the close is only booked once
+        TR confirms it; on rejection the position stays open and automatic
+        retries back off for LIVE_EXIT_RETRY_S (a manual close always tries).
+        `live_order=False` for a knock-out, which TR settles itself. Returns
+        True when the close was booked."""
+        if self._live_armed() and live_order:
+            isin = o.get("isin")
+            if not isin:
+                self.bus.warn(
+                    f"LIVE exit {o['underlying']} {o['kind']}: no ISIN on this position "
+                    f"(not a real TR instrument) — closing the local record only.",
+                    source="engine")
+            else:
+                now = self.now()
+                if not manual and self._exit_retry_at.get(o["id"], 0.0) > now:
+                    return False
+                size = float(int(o["contracts"]))   # whole certificates
+                res = self.broker.place_order(isin, "sell", size)
+                if not res.ok:
+                    self._exit_retry_at[o["id"]] = now + LIVE_EXIT_RETRY_S
+                    self.bus.warn(
+                        f"LIVE exit {o['underlying']} [{isin}] rejected/unconfirmed — "
+                        f"position stays open ({reason}): {res.message}", source="engine")
+                    return False
+                self._exit_retry_at.pop(o["id"], None)
+                reason = f"{reason} [live sell confirmed: {res.message}]"
+        self._book_option_close(o, mark, reason, label=label)
+        return True
+
+    def _book_option_close(self, o: dict, mark: float, reason: str,
+                           label: str = "CLOSE") -> float:
+        """Close an option/knockout at `mark` (paper bookkeeping): credit
+        proceeds minus the exit fee, P&L net of entry + exit fee, profit
+        stash, trade record, activity and strategy learning. Returns P&L."""
+        entry = max(1e-9, o["entry_premium"])
+        proceeds = mark * o["contracts"] - OPTION_FEE
+        pnl = (mark - entry) * o["contracts"] - 2 * OPTION_FEE   # entry + exit fee
+        self.broker.adjust_cash(max(0.0, proceeds))
+        self.store.record_cost("fee", OPTION_FEE, "options")
+        self.store.close_option(o["id"], mark, pnl)
+        for key in ("trail_peaks", "exit_overrides"):
+            state = self.store.get_meta(key) or {}
+            if state.pop(str(o["id"]), None) is not None:
+                self.store.set_meta(key, state)
+
+        # Profit stash: a configured fraction of realized PROFIT (never
+        # losses) is moved out of tradeable cash into a reserve. Still
+        # counted in net worth/alpha — just protected from being re-risked.
+        stash_pct = self.settings.economics.profit_stash_pct
+        if pnl > 0 and stash_pct > 0:
+            stash = pnl * stash_pct
+            if self.broker.adjust_cash(-stash):
+                self.store.add_reserve(stash)
+
+        self.store.record_trade(Trade(
+            o["underlying"], "sell", o["contracts"], mark, OPTION_FEE,
+            self.broker.mode, f"close {o['kind']} — {reason}", None))
+        self.bus.activity(
+            "trade",
+            f"{label} {o['kind'].upper()} {o['underlying']} pnl {pnl:+.3f} — {reason}",
+            o["underlying"], {"pnl": pnl})
+        self._record_learning(o.get("genome_id"), pnl)
+        return pnl
+
+    def process_close_requests(self) -> int:
+        """Execute manual close requests queued by the dashboard
+        (meta "close_requests") at the current price. Returns how many
+        positions were closed. A request without a trustworthy quote stays
+        queued for a retry; requests for positions that no longer exist are
+        dropped. Refused in armed live mode: this exit path only books
+        locally and does not send a real TR sell order."""
+        reqs = self.store.get_meta("close_requests") or []
+        if not reqs:
+            return 0
+        armed_live = self._live_armed()
+        keep: list[dict] = []
+        closed = 0
+        for r in reqs:
+            kind = r.get("kind")
+            if kind == "option":
+                o = next((x for x in self.store.open_options()
+                          if x["id"] == r.get("id")), None)
+                if o is None:
+                    continue
+                symbol, what = o["underlying"], f"{o['underlying']} {o['kind']}"
+            elif kind == "equity":
+                pos = self.store.position(r.get("symbol") or "")
+                if pos is None:
+                    continue
+                symbol, what = pos.symbol, pos.symbol
+            else:
+                continue
+            if armed_live and kind == "equity":
+                self.bus.warn(f"Manual close of {what} refused: the live bot can only sell "
+                              f"TR certificates by ISIN — close this one in the TR app.",
+                              source="engine")
+                continue
+            quote = self.market.quote(symbol)
+            if not self._is_trustworthy(quote):
+                keep.append(r)
+                if (kind, symbol) not in self._close_wait_logged:
+                    self._close_wait_logged.add((kind, symbol))
+                    self.bus.warn(f"Manual close of {what}: no trustworthy live price "
+                                  f"right now — will retry.", source="engine")
+                continue
+            self._close_wait_logged.discard((kind, symbol))
+            self._last_good_price[symbol] = quote.price
+            if kind == "option":
+                is_ko = (o.get("instrument_type") or "option") == "knockout"
+                knocked = is_ko and is_knocked_out(quote.price, o["barrier"], o["kind"])
+                mark = 0.0 if knocked else self._mark_position(o, quote.price)
+                if not self._exit_option(o, mark, "manual close from dashboard",
+                                         label="MANUAL CLOSE", live_order=not knocked,
+                                         manual=True):
+                    continue   # TR rejected: request dropped, warning logged
+            else:
+                res = self.broker.sell(symbol, pos.qty, quote.price)
+                if not res.ok:
+                    self.bus.warn(f"Manual close of {symbol} failed: {res.message}",
+                                  source="engine")
+                    continue
                 self.store.record_trade(Trade(
-                    o["underlying"], "sell", contracts, mark, OPTION_FEE,
-                    self.broker.mode,
-                    f"close {o['kind']} — stale ({age_h:.0f}h, {pnl_pct:+.1%}): "
-                    "freeing slot for stronger signal",
-                    None))
-                self.bus.activity(
-                    "trade",
-                    f"STALE CLOSE {o['kind'].upper()} {o['underlying']} "
-                    f"age={age_h:.0f}h pnl={pnl_pct:+.1%} → freed slot",
-                    o["underlying"], {"pnl": round(pnl, 4), "stale": True})
-                self._record_learning(o.get("genome_id"), pnl)
+                    symbol, "sell", res.qty, res.price, res.fee, self.broker.mode,
+                    "manual close from dashboard", None))
+                self.bus.activity("trade", f"MANUAL CLOSE {symbol} @ {res.price:.2f}",
+                                  symbol)
+            closed += 1
+        # Re-read: the dashboard may have queued more while we were working.
+        handled = [r for r in reqs if r not in keep]
+        current = self.store.get_meta("close_requests") or []
+        self.store.set_meta("close_requests", [r for r in current if r not in handled])
+        return closed
+
+    def _poll_close_requests(self) -> None:
+        if self.store.get_meta("close_requests"):
+            self.process_close_requests()
+
+    def _idle(self, seconds: float) -> None:
+        """Sleep between cycles, executing manual close requests within ~1s."""
+        deadline = time.time() + max(0.0, seconds)
+        while not self._stop:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+            self._poll_close_requests()
 
     def _record_learning(self, genome_id: str | None, pnl: float) -> None:
         if not (self.optimizer and genome_id):
@@ -454,6 +599,15 @@ class Engine:
 
     def _position_budget(self, quote: Quote, decision: Decision,
                          genome_id: str | None) -> float:
+        """Signal-scaled budget with the fee floor baked in (see
+        finance.risk.fee_aware_budget): raised to the fee minimum when the
+        hard caps allow it, 0.0 when no fee-compliant order fits."""
+        sized, ceiling = self._budget_bounds(quote, decision, genome_id)
+        return fee_aware_budget(sized, ceiling, OPTION_FEE,
+                                self.settings.risk.max_fee_pct)
+
+    def _budget_bounds(self, quote: Quote, decision: Decision,
+                       genome_id: str | None) -> tuple[float, float]:
         """Premium budget for a new position, layering the quant sizing rules:
         fractional Kelly from the genome's empirical edge (when proven),
         volatility targeting, and the storm-regime haircut. Falls back to the
@@ -492,7 +646,104 @@ class Engine:
         max_deployable = equity * (1.0 - cfg.cash_reserve_pct)
         available = max(0.0, max_deployable - deployed)
 
-        return min(fraction * equity, available, cash - OPTION_FEE)
+        ceiling = min(cfg.max_option_fraction * equity, available, cash - OPTION_FEE)
+        return min(fraction * equity, ceiling), ceiling
+
+    def _watchlist_triggers(self, candidates: list[tuple[Decision, str | None]],
+                            evaluated: set[str], quotes: dict[str, Quote],
+                            ) -> list[tuple[Decision, str | None]]:
+        """Entry timing (core/watchlist.py). Every live signal sits on the
+        watch list; only those whose price is stretched >= watch_k sigma from
+        the intraday SMA in their favour are returned for execution. Entries
+        expire after watch_max_hours, and a signal that expired is not
+        re-watched until it disappears or flips (else the timeout would just
+        restart forever)."""
+        cfg = self.settings.entry
+        now = self.now()
+        wl: dict = self.store.get_meta("watchlist") or {}
+        expired: dict = self.store.get_meta("watchlist_expired") or {}
+        current = {d.symbol: (d, g) for d, g in candidates}
+
+        for sym in list(wl):
+            if now - float(wl[sym]["added_ts"]) > cfg.watch_max_hours * 3600:
+                expired[sym] = wl.pop(sym)["direction"]
+                self.bus.info(f"[watch] {sym} expired after {cfg.watch_max_hours:g}h "
+                              f"without a >={cfg.watch_k:g}σ entry — dropped",
+                              source="engine")
+            elif sym in evaluated and sym not in current:
+                wl.pop(sym)
+                self.bus.info(f"[watch] {sym} removed — signal gone", source="engine")
+        for sym in list(expired):
+            if sym in evaluated and (sym not in current
+                                     or current[sym][0].direction != expired[sym]):
+                expired.pop(sym)
+
+        triggered: list[tuple[Decision, str | None]] = []
+        for sym, (decision, genome_id) in current.items():
+            if expired.get(sym) == decision.direction:
+                continue
+            quote = quotes[sym]
+            z = entry_z(quote.price, quote.history, cfg.watch_window)
+            z_txt = "n/a" if z is None else f"{z:+.2f}σ"
+            side = "below" if decision.direction == "buy" else "above"
+            entry = wl.get(sym)
+            if entry is None or entry["direction"] != decision.direction:
+                wl[sym] = {"direction": decision.direction,
+                           "confidence": round(decision.confidence, 3),
+                           "added_ts": now}
+                self.bus.info(
+                    f"[watch] {sym}: {decision.direction.upper()} conf "
+                    f"{decision.confidence:.2f} watching — enter at >={cfg.watch_k:g}σ "
+                    f"{side} intraday SMA (now {z_txt})", source="engine")
+            else:
+                entry["confidence"] = round(decision.confidence, 3)
+            if should_enter(decision.direction, z, cfg.watch_k):
+                self.bus.info(f"[watch] {sym}: {decision.direction.upper()} triggered "
+                              f"at {z_txt}", source="engine")
+                triggered.append((decision, genome_id))
+
+        self.store.set_meta("watchlist", wl)
+        self.store.set_meta("watchlist_expired", expired)
+        return triggered
+
+    def _prune_watchlist_entered(self) -> None:
+        """Drop watch entries for symbols that now hold a position."""
+        wl: dict = self.store.get_meta("watchlist") or {}
+        held = {o["underlying"] for o in self.store.open_options()}
+        held |= {p.symbol for p in self.store.positions()}
+        kept = {s: w for s, w in wl.items() if s not in held}
+        if len(kept) != len(wl):
+            self.store.set_meta("watchlist", kept)
+
+    def _fee_feasible(self, quote: Quote, decision: Decision,
+                      genome_id: str | None, econ) -> bool:
+        """Decision-time fee check: a signal whose largest allowed order can't
+        reach the fee-implied minimum is dropped here, so it never takes a
+        slot or reaches execution."""
+        pct = self.settings.risk.max_fee_pct
+        if self.settings.options.enabled:
+            fee = OPTION_FEE
+            _, ceiling = self._budget_bounds(quote, decision, genome_id)
+        else:
+            fee = getattr(self.broker, "fee", 0.0)
+            ceiling = min(self.broker.cash(),
+                          econ.net_worth_eur * self.settings.risk.max_position_fraction)
+        floor = min_notional_for_fee(fee, pct)
+        if ceiling >= floor:
+            return True
+        self.bus.info(
+            f"[fee-guard] {decision.symbol}: {decision.direction.upper()} "
+            f"conf {decision.confidence:.2f} dropped — largest allowed order "
+            f"€{max(ceiling, 0.0):.2f} < €{floor:.2f} minimum (fee {fee:.2f} "
+            f"≤ {pct:.1%})", source="engine")
+        return False
+
+    def _fee_skip(self, symbol: str, notional: float, fee: float) -> None:
+        pct = self.settings.risk.max_fee_pct
+        self.bus.info(
+            f"[fee-guard] {symbol} skipped: fee {fee:.2f} is "
+            f"{fee / max(notional, 1e-9):.1%} of {notional:.2f} (max {pct:.1%})",
+            source="engine")
 
     def _enter_knockout(self, quote: Quote, decision: Decision,
                         genome_id: str | None) -> bool:
@@ -509,6 +760,9 @@ class Engine:
         budget = self._position_budget(quote, decision, genome_id)
         if budget <= 0.05:
             return True   # handled (deliberately no trade), don't fall back
+        if not fee_ratio_ok(budget, OPTION_FEE, self.settings.risk.max_fee_pct):
+            self._fee_skip(quote.symbol, budget, OPTION_FEE)
+            return True
         contracts = budget / ko.price
 
         # Real execution: when the broker is an ARMED live broker, place a
@@ -594,6 +848,9 @@ class Engine:
         budget = self._position_budget(quote, decision, genome_id)
         if budget <= 0.05:
             return
+        if not fee_ratio_ok(budget, OPTION_FEE, self.settings.risk.max_fee_pct):
+            self._fee_skip(quote.symbol, budget, OPTION_FEE)
+            return
         contracts = budget / oq.premium
         cost = contracts * oq.premium + OPTION_FEE
         if not self.broker.adjust_cash(-cost):
@@ -622,8 +879,12 @@ class Engine:
             sizing = size_position(
                 price=quote.price, cash=self.broker.cash(),
                 equity=econ.net_worth_eur, confidence=decision.confidence,
-                cfg=self.settings.risk)
+                cfg=self.settings.risk,
+                fee=getattr(self.broker, "fee", 0.0))
             if sizing.qty <= 0:
+                if "fee" in sizing.reason:
+                    self.bus.info(f"[fee-guard] {quote.symbol} skipped: {sizing.reason}",
+                                  source="engine")
                 return
             res = self.broker.buy(quote.symbol, sizing.qty, quote.price)
             if res.ok:
@@ -643,6 +904,7 @@ class Engine:
 
     # ------------------------------------------------------------------- cycle
     def run_cycle(self) -> None:
+        self.process_close_requests()
         self._run_scheduled_jobs()
 
         symbols = list(dict.fromkeys(
@@ -748,6 +1010,7 @@ class Engine:
                     f"— no free slots, holding existing positions this cycle",
                     source="engine")
             candidates: list[tuple[Decision, str | None]] = []
+            evaluated: set[str] = set()   # symbols whose signal was re-read this cycle
             for symbol in self.settings.universe:
                 if slots <= 0:
                     break
@@ -758,7 +1021,9 @@ class Engine:
                     continue
                 if not self.accountant.can_afford_inference(econ, est_usd=0.01):
                     break
+                self._poll_close_requests()   # manual closes stay snappy mid-cycle
                 decision, genome_id = self._decide(quotes[symbol])
+                evaluated.add(symbol)
                 self.bus.activity(
                     "decision",
                     f"{symbol}: {decision.direction.upper()} conf {decision.confidence:.2f}",
@@ -771,7 +1036,12 @@ class Engine:
                     min_conf += self.settings.sizing.storm_extra_confidence
                 if decision.direction == "hold" or decision.confidence < min_conf:
                     continue
+                if not self._fee_feasible(quotes[symbol], decision, genome_id, econ):
+                    continue
                 candidates.append((decision, genome_id))
+
+            if self.settings.entry.watch_enabled:
+                candidates = self._watchlist_triggers(candidates, evaluated, quotes)
 
             # Rank by confidence so limited slots go to the strongest signals
             # across the whole universe, not just whichever symbols happened
@@ -783,6 +1053,10 @@ class Engine:
                 take = min(take, cap)
             for decision, genome_id in candidates[:take]:
                 quote = quotes[decision.symbol]
+                # Re-check against CURRENT capital: earlier entries this cycle
+                # may have used up the deployable bucket since selection.
+                if not self._fee_feasible(quote, decision, genome_id, econ):
+                    continue
                 if self.settings.options.enabled:
                     # Prefer real TR knockout instruments when the (optional)
                     # TR client is authenticated; fall back to synthetic
@@ -807,6 +1081,8 @@ class Engine:
                             self._enter_option(quote, decision, genome_id)
                 else:
                     self._enter_equity(quote, decision, econ)
+            if self.settings.entry.watch_enabled:
+                self._prune_watchlist_entered()
 
         cash = self.broker.cash()
         equity = cash + self._positions_value(prices) + self._options_value(prices)
@@ -844,4 +1120,4 @@ class Engine:
                 self.bus.info("Control changed (paper/live/armed) — reconfiguring.")
                 break
             elapsed = time.time() - started
-            time.sleep(max(0.0, self.settings.loop.interval_seconds - elapsed))
+            self._idle(self.settings.loop.interval_seconds - elapsed)

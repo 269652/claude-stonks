@@ -42,7 +42,7 @@ def _anthropic_caller(settings: Settings) -> Caller | None:
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": settings.model.cloud_model, "max_tokens": 700,
+            json={"model": settings.research.analysis_model, "max_tokens": 700,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=60.0,
         )
@@ -55,7 +55,7 @@ def _anthropic_caller(settings: Settings) -> Caller | None:
 
 
 def _claude_cli_caller(settings: Settings) -> Caller | None:
-    provider = ClaudeCLIProvider(settings)
+    provider = ClaudeCLIProvider(settings, model=settings.research.analysis_model)
     return provider.ask if provider.available() else None
 
 

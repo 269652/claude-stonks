@@ -114,6 +114,18 @@ class TestDashboardShell:
         # actually re-fetched instead of rendered against a new HTML shell.
         assert "app.js?v=" in html
 
+    def test_no_subsidised_banner(self):
+        """The yellow 'Subsidised — not yet covering compute' banner was
+        removed on request: in that (normal) state the economics banner is
+        hidden. Outperforming and runway-halt banners stay."""
+        from pathlib import Path
+
+        js = (Path(__file__).parents[1] / "src" / "lmtrade" / "web" / "static"
+              / "app.js").read_text(encoding="utf-8")
+        assert "Subsidised" not in js
+        assert "Runway below floor" in js
+        assert "Outperforming" in js
+
     def test_dashboard_html_contains_all_element_ids_used_by_appjs(self, client):
         """Regression: app.js uses $(id) = document.getElementById(id) to
         drive every paint function. If an element is removed from the HTML

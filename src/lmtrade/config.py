@@ -60,6 +60,7 @@ class RiskConfig(BaseModel):
     stop_loss_pct: float = 0.05
     take_profit_pct: float = 0.08
     min_confidence: float = 0.55
+    max_fee_pct: float = 0.01   # skip entries whose fee > this fraction of notional (0 = off)
 
 
 class EconomicsConfig(BaseModel):
@@ -116,6 +117,9 @@ class ResearchConfig(BaseModel):
     # "anthropic" (needs ANTHROPIC_API_KEY) or "claude_cli" (local `claude`
     # CLI, no API key).
     analysis_provider: str = "anthropic"
+    # Model for the DAILY strategy review (independent of the cheap per-symbol
+    # `model.cloud_model`); used by both the anthropic and claude_cli providers.
+    analysis_model: str = "claude-opus-5-5"
     # Per-call timeout for the local `claude` CLI. A single web-search-backed
     # research/analysis call routinely takes well over a minute, so the
     # default is generous; raise it further on a slow connection.
@@ -127,12 +131,28 @@ class ResearchConfig(BaseModel):
     news_retry_minutes: int = 10
 
 
+class EntryConfig(BaseModel):
+    """Watch-list entry timing (core/watchlist.py). Off in code so callers that
+    build Settings() directly keep immediate entries; config/default.yaml
+    turns it on for the running bot."""
+    watch_enabled: bool = False
+    watch_k: float = 1.0           # enter at >= k sigma from the intraday SMA
+    watch_window: int = 60         # bars of history for the SMA / std
+    watch_max_hours: float = 4.0   # drop the watch entry after this long
+
+
 class OptionsConfig(BaseModel):
     enabled: bool = True
     expiry_days: float = 7.0
     max_option_fraction: float = 0.3   # max fraction of equity in one premium
     take_profit_pct: float = 0.5       # +50% premium -> take profit
     stop_loss_pct: float = 0.4         # -40% premium -> cut
+    # Trailing take-profit on net EUR profit (after entry + exit fee): arms at
+    # trail_min_profit_eur / (1 - trail_pct), then closes when profit falls
+    # trail_pct below its peak — never below trail_min_profit_eur.
+    trail_enabled: bool = False
+    trail_min_profit_eur: float = 20.0
+    trail_pct: float = 0.15
     min_hours_to_expiry: float = 24.0  # force-close inside this window
     min_hold_hours: float = 0.0        # block TP/SL exits before this many
                                        # hours have passed (0 = no minimum).
@@ -215,6 +235,7 @@ class Settings(BaseModel):
     economics: EconomicsConfig = EconomicsConfig()
     research: ResearchConfig = ResearchConfig()
     options: OptionsConfig = OptionsConfig()
+    entry: EntryConfig = EntryConfig()
     learning: LearningConfig = LearningConfig()
     benchmark: BenchmarkConfig = BenchmarkConfig()
     tr: TRConfig = TRConfig()
@@ -268,6 +289,8 @@ def _apply_env_overrides(cfg: dict[str, Any]) -> dict[str, Any]:
         cfg.setdefault("research", {})["news_provider"] = v
     if v := env("LMTRADE_ANALYSIS_PROVIDER"):
         cfg.setdefault("research", {})["analysis_provider"] = v
+    if v := env("LMTRADE_ANALYSIS_MODEL"):
+        cfg.setdefault("research", {})["analysis_model"] = v
     if v := env("LMTRADE_GPU_USD_PER_HOUR"):
         cfg.setdefault("economics", {})["gpu_usd_per_hour"] = float(v)
     if v := env("LMTRADE_MIN_RUNWAY_HOURS"):

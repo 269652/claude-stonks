@@ -35,6 +35,7 @@ def settings(tmp_path: Path) -> Settings:
     s.data_dir = tmp_path
     s.loop.interval_seconds = 1
     s.risk.min_confidence = 1.1   # block new entries; isolate the exit path
+    s.risk.max_fee_pct = 0.0   # fee guard has its own tests (test_fee_guard.py)
     s.options.enabled = True
     s.learning.enabled = False
     return s
@@ -105,12 +106,15 @@ class TestProfitStash:
         engine = make_engine(settings, store, market)
         cash_before = engine.broker.cash()
         store.open_option("AAPL", "call", strike=0.01, expiry_ts=time.time() + 5 * 86400,
-                          iv=0.4, contracts=0.01, entry_premium=0.01, genome_id=None)
+                          iv=0.4, contracts=1.0, entry_premium=0.01, genome_id=None)
         engine.run_cycle()
         pnl = store.closed_options()[0]["pnl"]
         stash = store.reserve_balance()
-        # tradeable cash gained (proceeds - stash), not the full proceeds
-        assert engine.broker.cash() < cash_before + pnl
+        # tradeable cash gained (proceeds - stash), not the full proceeds. The
+        # planted position never paid its entry fee out of cash, hence the
+        # + OPTION_FEE allowance (pnl already deducts it).
+        from lmtrade.core.engine import OPTION_FEE
+        assert engine.broker.cash() < cash_before + pnl + OPTION_FEE
         assert stash > 0
 
     def test_reserve_included_in_reported_net_worth(self, settings, store):

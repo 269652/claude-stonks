@@ -26,6 +26,7 @@ def settings(tmp_path: Path) -> Settings:
     s.risk.min_confidence = 0.5
     s.options.enabled = True
     s.learning.enabled = True
+    s.risk.max_fee_pct = 0.0   # small budgets here; fee guard has its own tests
     return s
 
 
@@ -101,8 +102,8 @@ class TestOptionsTrading:
         # Deep ITM call opened at a tiny premium -> mark >> entry -> take profit.
         store.open_option("AAPL", "call", strike=0.01,
                           expiry_ts=time.time() + 5 * 86400,
-                          iv=0.4, contracts=0.01, entry_premium=0.01,
-                          genome_id=None)
+                          iv=0.4, contracts=1.0, entry_premium=0.01,
+                          genome_id=None)   # gross win must beat the 2x1 EUR fees
         cash_before = engine.broker.cash()
         engine.run_cycle()
         closed = store.closed_options()

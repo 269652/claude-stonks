@@ -87,6 +87,7 @@ risk:
   stop_loss_pct: 0.05
   take_profit_pct: 0.08
   min_confidence: 0.55
+  max_fee_pct: 0.01        # skip entries whose fee exceeds 1% of order value (0 = off)
 
 options:                   # synthetic Black-Scholes options layer (paper)
   enabled: true
@@ -96,8 +97,17 @@ options:                   # synthetic Black-Scholes options layer (paper)
                              # max_positions can now fill concurrently
   take_profit_pct: 0.5       # +50% premium -> take profit
   stop_loss_pct: 0.4         # -40% premium -> cut
+  trail_enabled: true        # trailing take-profit on net EUR profit (after both fees):
+  trail_min_profit_eur: 20.0 #   arms at 20 / (1 - 0.15) = 23.53 EUR profit, then closes
+  trail_pct: 0.15            #   15% below the peak profit — never below +20 EUR
   min_hours_to_expiry: 24    # force-close inside this window
   cash_reserve_pct: 0.40     # keep 40 % of net worth in cash; deploy the rest
+
+entry:                     # watch-list entry timing (core/watchlist.py)
+  watch_enabled: true      # signals wait for a better price instead of market entry
+  watch_k: 1.0             # enter at >= 1 sigma below (buy) / above (sell) the intraday SMA
+  watch_window: 60         # bars used for that SMA / std (1m bars intraday)
+  watch_max_hours: 4.0     # drop the watch entry if no good entry comes within this time
 
 learning:                  # evolutionary strategy optimizer
   enabled: true

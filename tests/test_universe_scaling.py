@@ -98,6 +98,7 @@ def settings(tmp_path: Path) -> Settings:
     s.loop.interval_seconds = 1
     s.loop.max_positions = 2       # fewer slots than candidates
     s.risk.min_confidence = 0.5
+    s.risk.max_fee_pct = 0.0   # fee guard has its own tests (test_fee_guard.py)
     s.options.enabled = True
     s.learning.enabled = False
     return s

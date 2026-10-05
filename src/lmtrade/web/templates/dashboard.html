@@ -62,7 +62,18 @@
   .provider-warning-banner.show { display:block; }
   .muted { color:var(--muted); }
   .num.pos { color:var(--green); } .num.neg { color:var(--red); }
-  svg#chart { width:100%; height:120px; }
+  svg#chart { width:100%; height:120px; display:block; overflow:visible; }
+  .chart-wrap { position:relative; padding-left:56px; }
+  .chart-yaxis { position:absolute; left:0; top:0; width:50px; height:120px; }
+  .chart-yaxis span { position:absolute; right:6px; transform:translateY(-50%);
+                      font-size:10px; color:var(--muted); white-space:nowrap; }
+  .chart-xaxis { display:flex; justify-content:space-between; padding-left:56px;
+                 margin-top:4px; font-size:10px; color:var(--muted); }
+  .chart-tip { display:none; position:absolute; top:0; pointer-events:none; z-index:5;
+               background:var(--panel); border:1px solid var(--line); border-radius:8px;
+               padding:6px 9px; font-size:12px; line-height:1.45; white-space:nowrap; }
+  .chart-tip .t { color:var(--muted); font-size:11px; }
+  .chart-tip .pos { color:var(--green); } .chart-tip .neg { color:var(--red); }
   .refresh { display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
   .ring { width:18px; height:18px; }
   .ring-progress { animation:ringfill 5s linear infinite; }
@@ -78,6 +89,17 @@
   .tab .unread { position:absolute; top:-6px; right:-6px; background:var(--red); color:#fff;
                  font-size:10px; font-weight:700; min-width:16px; height:16px; line-height:16px;
                  text-align:center; border-radius:9px; padding:0 4px; }
+  td.exits { font-size:12px; line-height:1.5; white-space:nowrap; }
+  td.exits .pos { color:var(--green); } td.exits .neg { color:var(--red); }
+  td.exits .lock { color:var(--green); font-weight:600; }
+  .exits-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
+               color:var(--muted); border-radius:6px; padding:1px 8px; font-size:12px;
+               margin-top:3px; }
+  .exits-btn:hover { color:var(--text); border-color:var(--blue); }
+  .close-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
+               color:var(--muted); border-radius:6px; padding:3px 10px; font-size:12px; }
+  .close-btn:hover { color:var(--red); border-color:var(--red); }
+  .close-btn:disabled { cursor:default; opacity:.6; color:var(--muted); border-color:var(--line); }
   .iconbtn { cursor:pointer; background:var(--panel); border:1px solid var(--line); color:var(--muted);
              border-radius:8px; padding:5px 9px; font-size:14px; }
   .iconbtn:hover { color:var(--text); border-color:var(--blue); }
@@ -155,6 +177,34 @@
     </div>
   </div>
 </div>
+<div id="exits-overlay" class="overlay">
+  <div class="modal" style="width:min(480px,100%)">
+    <h2 id="exits-title">Exits</h2>
+    <div class="muted" style="font-size:12px;">Amounts are net € after both 1 € fees.
+      Leave a field empty to turn that exit off.</div>
+    <div class="settings-grid">
+      <div class="setrow"><label>Take-profit (€ net)</label>
+        <input id="ex-tp" type="number" step="0.5" placeholder="off"></div>
+      <div class="setrow"><label>Stop-loss (€ net, negative = loss)</label>
+        <input id="ex-sl" type="number" step="0.5" placeholder="off"></div>
+      <div class="setsection">Trailing take-profit</div>
+      <div class="setrow"><label>Trailing</label>
+        <select id="ex-trail-on"><option value="1">on</option><option value="0">off</option></select></div>
+      <div class="setrow"><label>Never below (€ net)</label>
+        <input id="ex-trail-min" type="number" step="1" min="0"></div>
+      <div class="setrow"><label>Drop from peak (%)</label>
+        <input id="ex-trail-pct" type="number" step="1" min="0" max="99"></div>
+      <div class="setrow"><label>Arms at</label>
+        <div id="ex-trail-arm" class="muted" style="padding:7px 0; font-size:13px;"></div></div>
+    </div>
+    <div class="modal-actions">
+      <span id="exits-status" class="muted" style="flex:1; font-size:12px;"></span>
+      <button class="btn" id="exits-reset">Reset to defaults</button>
+      <button class="btn" id="exits-cancel">Cancel</button>
+      <button class="btn primary" id="exits-save">Save</button>
+    </div>
+  </div>
+</div>
 <main>
   <div id="exec-banner" class="exec-banner"><span class="ic" id="exec-ic"></span><span id="exec-text"></span></div>
   <div id="econ" class="econ-banner econ-ok">loading economics…</div>
@@ -170,7 +220,14 @@
 
   <section>
     <h2>Equity Curve</h2>
-    <div class="card"><svg id="chart" viewBox="0 0 600 120" preserveAspectRatio="none"></svg></div>
+    <div class="card">
+      <div class="chart-wrap" id="chart-wrap">
+        <div class="chart-yaxis" id="chart-yaxis"></div>
+        <svg id="chart" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+        <div class="chart-tip" id="chart-tip"></div>
+      </div>
+      <div class="chart-xaxis"><span id="chart-x0"></span><span id="chart-x1"></span></div>
+    </div>
   </section>
 
   <div class="tabs">
@@ -186,7 +243,7 @@
   </div>
 
   <section id="tab-positions">
-    <table><thead><tr><th>Symbol</th><th>Type</th><th>ISIN</th><th>Qty</th><th>Avg Price</th><th>Value</th><th>P&amp;L</th></tr></thead>
+    <table><thead><tr><th>Symbol</th><th>Type</th><th>ISIN</th><th>Qty</th><th>Avg Price</th><th>Value</th><th>P&amp;L</th><th>Exits</th><th></th></tr></thead>
       <tbody id="positions"></tbody></table>
   </section>
 
@@ -230,6 +287,7 @@
     <div class="logs" id="logs"></div>
   </section>
 </main>
+<script src="/static/chart.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

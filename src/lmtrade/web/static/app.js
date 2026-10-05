@@ -34,7 +34,8 @@ async function refresh() {
     paintTrades(trades);
     paintActivity(activity);
     paintLogs(logs);
-    paintChart(equity);
+    // Same baseline as the P&L tile in paper mode; live falls back to the first point.
+    paintChart(equity, ctrl.mode === "live" ? null : s.starting_cash);
     paintStrategies(strategies);
     paintRealized(realized);
     paintSignals(signals);
@@ -112,6 +113,8 @@ function paintSummary(s) {
     netKnown = true;
     pnl = econ.pnl_eur != null ? econ.pnl_eur : net - (s.starting_cash || 0);
   }
+  // Live last point for the equity chart, so it ends exactly at this tile.
+  window._liveNow = netKnown ? {equity: net, cash: cash} : null;
 
   $("net").textContent = netKnown ? fmt(net) + " " + cur : "—";
   const pnlEl = $("pnl");
@@ -131,8 +134,8 @@ function paintSummary(s) {
   cashEl.className = "v" + (isLive && ctrl.low_balance ? " warn" : "");
   $("reserve").textContent = fmt(s.reserve != null ? s.reserve : (econ.reserve_eur || 0)) + " " + cur;
   $("npos").textContent = s.num_positions;
-  const compute = (econ.gpu_cost_accrued_usd || 0) + (econ.inference_cost_usd || 0);
   const banner = $("econ");
+  banner.style.display = "";
   if (econ.self_sustaining) {
     banner.className = "econ-banner econ-ok";
     const alpha = s.alpha;
@@ -142,8 +145,8 @@ function paintSummary(s) {
     banner.className = "econ-banner econ-warn";
     banner.innerHTML = `⛔ <b>Runway below floor</b> (${fmt(econ.runway_hours,1)}h) — new entries halted, managing exits only.`;
   } else {
-    banner.className = "econ-banner econ-warn";
-    banner.innerHTML = `⏳ <b>Subsidised</b> — not yet covering compute. Net worth $${fmt(econ.net_worth_usd,2)}, compute spent $${fmt(compute,4)}, runway ${fmt(econ.runway_hours,1)}h.`;
+    // Normal state (not yet covering compute): no banner.
+    banner.style.display = "none";
   }
 
   // Provider warning banner (e.g. Claude usage limit hit)
@@ -165,13 +168,110 @@ function pnlCell(v) {
   return `<td class="num ${cls}">${sign}${fmt(v)}</td>`;
 }
 
+// TP / SL as premium level plus the net EUR result if hit (both fees out),
+// and the trailing take-profit state.
+function exitsCell(p) {
+  const eur = v => v == null ? "—" : (v >= 0 ? "+" : "") + fmt(v) + " €";
+  const parts = [];
+  if (p.tp_price != null)
+    parts.push(`<span class="pos">TP</span> ${fmt(p.tp_price)} <span class="muted">(${eur(p.tp_pnl)})</span>`);
+  if (p.sl_price != null)
+    parts.push(`<span class="neg">SL</span> ${fmt(p.sl_price)} <span class="muted">(${eur(p.sl_pnl)})</span>`);
+  const t = p.trail;
+  if (t && t.enabled) {
+    parts.push(t.active
+      ? `<span class="lock">🔒 Trail ≥ ${eur(t.stop_pnl)}</span> <span class="muted">(peak ${eur(t.peak_pnl)})</span>`
+      : `<span class="muted">Trail arms at ${eur(t.arm_pnl)}</span>`);
+  }
+  if (p.close_kind === "option" && p.id != null) {
+    parts.push(`<button class="exits-btn" data-id="${p.id}" title="Configure exits">`
+      + `${p.exits_custom ? "✎ custom" : "+"}</button>`);
+  }
+  return parts.length ? `<td class="exits">${parts.join("<br>")}</td>` : `<td class="muted">—</td>`;
+}
+
+function closeButton(p) {
+  if (!p.close_kind) return "<td></td>";
+  if (p.close_pending) return `<td><button class="close-btn" disabled>closing…</button></td>`;
+  const attrs = p.close_kind === "option" ? `data-id="${p.id}"` : `data-symbol="${p.close_symbol}"`;
+  return `<td><button class="close-btn" data-kind="${p.close_kind}" ${attrs}`
+    + ` data-label="${p.symbol}">Close</button></td>`;
+}
+
 function paintPositions(rows) {
+  window._posRows = {};
+  rows.forEach(p => { if (p.id != null) window._posRows[p.id] = p; });
   $("positions").innerHTML = rows.length
     ? rows.map(p => `<tr><td>${p.symbol}</td><td><span class="kind">${p.kind || "equity"}</span></td>`
         + `<td>${p.isin || "—"}</td><td>${fmt(p.qty,4)}</td><td>${fmt(p.avg_price)}</td>`
-        + `<td>${p.value == null ? "—" : fmt(p.value)}</td>${pnlCell(p.unrealized_pnl)}</tr>`).join("")
-    : `<tr><td colspan="7" class="muted">No open positions.</td></tr>`;
+        + `<td>${p.value == null ? "—" : fmt(p.value)}</td>${pnlCell(p.unrealized_pnl)}`
+        + `${exitsCell(p)}${closeButton(p)}</tr>`).join("")
+    : `<tr><td colspan="9" class="muted">No open positions.</td></tr>`;
 }
+
+// Per-position exits modal (+ / ✎ in the Exits column). Values in net EUR.
+let exitsId = null;
+const num = v => (v === "" || v == null) ? null : Number(v);
+function paintTrailArm() {
+  const min = num($("ex-trail-min").value), pct = num($("ex-trail-pct").value);
+  $("ex-trail-arm").textContent = ($("ex-trail-on").value === "1" && min != null && pct != null
+      && pct >= 0 && pct < 100) ? `+${fmt(min / (1 - pct / 100))} € profit` : "—";
+}
+function openExits(p) {
+  exitsId = p.id;
+  const r2 = v => v == null ? "" : Math.round(v * 100) / 100;
+  $("exits-title").textContent = `Exits · ${p.symbol}`;
+  $("ex-tp").value = r2(p.tp_pnl);
+  $("ex-sl").value = r2(p.sl_pnl);
+  $("ex-trail-on").value = p.trail && p.trail.enabled ? "1" : "0";
+  $("ex-trail-min").value = p.trail ? r2(p.trail.min_pnl) : "";
+  $("ex-trail-pct").value = p.trail ? r2(p.trail.pct * 100) : "";
+  $("exits-status").textContent = p.exits_custom ? "custom settings for this position" : "using defaults";
+  paintTrailArm();
+  $("exits-overlay").classList.add("show");
+}
+["ex-trail-on", "ex-trail-min", "ex-trail-pct"].forEach(id =>
+  $(id).addEventListener("input", paintTrailArm));
+$("positions").addEventListener("click", ev => {
+  const btn = ev.target.closest(".exits-btn");
+  if (btn && window._posRows[btn.dataset.id]) openExits(window._posRows[btn.dataset.id]);
+});
+async function saveExits(body) {
+  const res = await postJSON("/api/positions/exits", {id: exitsId, ...body});
+  if (!res.ok) { $("exits-status").textContent = "⚠ " + (res.error || "could not save"); return; }
+  $("exits-overlay").classList.remove("show");
+  refresh();
+}
+$("exits-save").addEventListener("click", () => {
+  const pct = num($("ex-trail-pct").value);
+  saveExits({
+    tp_pnl: num($("ex-tp").value), sl_pnl: num($("ex-sl").value),
+    trail_enabled: $("ex-trail-on").value === "1",
+    trail_min_profit_eur: num($("ex-trail-min").value),
+    trail_pct: pct == null ? null : pct / 100,
+  });
+});
+$("exits-reset").addEventListener("click", () => saveExits({reset: true}));
+$("exits-cancel").addEventListener("click", () => $("exits-overlay").classList.remove("show"));
+$("exits-overlay").addEventListener("click", e => {
+  if (e.target.id === "exits-overlay") $("exits-overlay").classList.remove("show");
+});
+
+// Manual close: queue a request; the engine sells at the current price within
+// seconds (fee + P&L booked like any other exit).
+$("positions").addEventListener("click", async ev => {
+  const btn = ev.target.closest(".close-btn");
+  if (!btn || btn.disabled) return;
+  if (!confirm(`Close ${btn.dataset.label} now at the current price?\n\n`
+               + "The 1 EUR exit fee applies.")) return;
+  btn.disabled = true; btn.textContent = "closing…";
+  const body = btn.dataset.kind === "option"
+    ? {kind: "option", id: Number(btn.dataset.id)}
+    : {kind: "equity", symbol: btn.dataset.symbol};
+  const res = await postJSON("/api/positions/close", body);
+  if (!res.queued) { alert("Close failed: " + (res.error || "unknown error")); }
+  refresh();
+});
 
 function paintStrategies(rows) {
   $("strategies").innerHTML = rows && rows.length
@@ -280,24 +380,74 @@ function paintAnalysis(a) {
     : `<tr><td colspan="4" class="muted">No daily analysis compiled yet.</td></tr>`;
 }
 
-function paintChart(curve) {
-  const svg = $("chart");
-  if (!curve || curve.length < 2) { svg.innerHTML = ""; return; }
-  const vals = curve.map(p => p.equity);
-  const min = Math.min(...vals), max = Math.max(...vals);
-  const span = max - min || 1;
-  const W = 600, H = 120, pad = 4;
-  const pts = vals.map((v, i) => {
-    const x = (i / (vals.length - 1)) * W;
-    const y = H - pad - ((v - min) / span) * (H - 2 * pad);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-  const up = vals[vals.length - 1] >= vals[0];
-  const color = up ? "#3fb950" : "#f85149";
-  svg.innerHTML = `
-    <polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}" />
-    <polygon fill="${color}22" points="0,${H} ${pts} ${W},${H}" />`;
+const CHART_W = 600, CHART_H = 120;
+
+function fmtTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
 }
+
+function paintChart(curve, baseline) {
+  const svg = $("chart");
+  curve = LMChart.withLivePoint(curve, window._liveNow, Date.now() / 1000);
+  const m = LMChart.chartModel(curve, baseline, CHART_W, CHART_H);
+  window._chart = m;
+  if (!m) {
+    svg.innerHTML = ""; $("chart-yaxis").innerHTML = "";
+    $("chart-x0").textContent = ""; $("chart-x1").textContent = "";
+    return;
+  }
+  const color = m.up ? "#3fb950" : "#f85149";
+  const pts = m.points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+  svg.innerHTML = `
+    <polygon fill="${color}22" points="0,${CHART_H} ${pts} ${CHART_W},${CHART_H}" />
+    <line x1="0" x2="${CHART_W}" y1="${m.baselineY.toFixed(1)}" y2="${m.baselineY.toFixed(1)}"
+          stroke="#8b98a5" stroke-width="1" stroke-dasharray="4 4" vector-effect="non-scaling-stroke" />
+    <polyline fill="none" stroke="${color}" stroke-width="2" points="${pts}"
+              vector-effect="non-scaling-stroke" />
+    <line class="chart-cursor" x1="0" x2="0" y1="0" y2="${CHART_H}" stroke="#8b98a5"
+          stroke-width="1" vector-effect="non-scaling-stroke" visibility="hidden" />`;
+  const labels = m.ticks.map(t => `<span style="top:${t.y}px">${fmt(t.value)}</span>`);
+  labels.push(`<span style="top:${m.baselineY}px">start ${fmt(m.baseline)}</span>`);
+  $("chart-yaxis").innerHTML = labels.join("");
+  $("chart-x0").textContent = fmtTime(m.points[0].ts);
+  $("chart-x1").textContent = fmtTime(m.points[m.points.length - 1].ts);
+  // The 5s refresh redraws the SVG; keep an active hover in place.
+  if (window._hoverX != null) showChartTip(window._hoverX);
+}
+
+// Hover tooltip: nearest point by time, with net worth, P&L vs start, cash.
+function showChartTip(clientX) {
+  const m = window._chart, svg = $("chart"), tip = $("chart-tip");
+  if (!m) return;
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width) return;
+  const i = LMChart.nearestIndex(m.points, (clientX - rect.left) / rect.width * CHART_W);
+  if (i < 0) return;
+  const p = m.points[i];
+  const cursor = $("chart").querySelector(".chart-cursor");
+  cursor.setAttribute("x1", p.x); cursor.setAttribute("x2", p.x);
+  cursor.setAttribute("visibility", "visible");
+  const diff = p.equity - m.baseline;
+  tip.innerHTML = `<div class="t">${fmtTime(p.ts)}</div>` +
+    `<div><b>${fmt(p.equity)} EUR</b></div>` +
+    `<div class="${diff >= 0 ? "pos" : "neg"}">${diff >= 0 ? "+" : ""}${fmt(diff)} vs start</div>` +
+    (p.cash != null ? `<div class="t">cash ${fmt(p.cash)}</div>` : "");
+  tip.style.display = "block";
+  const wrap = $("chart-wrap").getBoundingClientRect();
+  const px = rect.left - wrap.left + p.x / CHART_W * rect.width;
+  tip.style.left = Math.min(Math.max(px + 12, 0), wrap.width - tip.offsetWidth) + "px";
+}
+$("chart").addEventListener("mousemove", ev => {
+  window._hoverX = ev.clientX;
+  showChartTip(ev.clientX);
+});
+$("chart").addEventListener("mouseleave", () => {
+  window._hoverX = null;
+  $("chart-tip").style.display = "none";
+  const cursor = $("chart").querySelector(".chart-cursor");
+  if (cursor) cursor.setAttribute("visibility", "hidden");
+});
 
 // Tabs
 document.querySelectorAll(".tab").forEach(tab => {

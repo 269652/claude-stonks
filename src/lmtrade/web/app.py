@@ -19,6 +19,8 @@ from fastapi.staticfiles import StaticFiles
 
 from ..config import DEFAULT_TOML_PATH, Settings, load_settings
 from ..core.control import LOW_BALANCE_EUR, ControlState
+from ..core.engine import OPTION_FEE
+from ..core.exits import exit_plan, pnl_for_premium, validate_override
 from ..core.state import Store
 from . import settings_editor
 
@@ -96,11 +98,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if STATIC.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
-    def _asset_version() -> str:
-        """Short content hash of app.js, appended as ?v= to its URL so a
-        changed file bypasses the browser cache (otherwise a pulled app.js is
-        rendered against a freshly-served HTML shell — column mismatch)."""
-        js = STATIC / "app.js"
+    def _asset_version(name: str = "app.js") -> str:
+        """Short content hash of a static script, appended as ?v= to its URL
+        so a changed file bypasses the browser cache (otherwise a pulled
+        app.js is rendered against a freshly-served HTML shell — column
+        mismatch)."""
+        js = STATIC / name
         if not js.exists():
             return "0"
         return hashlib.sha1(js.read_bytes()).hexdigest()[:8]
@@ -111,7 +114,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # which on Windows is cp1252 and mangles the template's ⚡/· glyphs
         # into mojibake (âš¡ / Â·) before they're ever served.
         html = (TEMPLATES / "dashboard.html").read_text(encoding="utf-8")
-        return html.replace("/static/app.js", f"/static/app.js?v={_asset_version()}")
+        for name in ("chart.js", "app.js"):
+            html = html.replace(f"/static/{name}",
+                                f"/static/{name}?v={_asset_version(name)}")
+        return html
 
     def _tr_meta(key: str):
         """TR account meta (cash/baseline), read from the live book first,
@@ -152,14 +158,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # positions" even when full. For an option, qty=contracts and
         # avg_price=entry premium; the real TR ISIN is surfaced when present.
         marks = store().get_meta("open_option_marks", {}) or {}
+        pending = store().get_meta("close_requests") or []
         rows = [
             {"symbol": p.symbol, "qty": round(p.qty, 6),
              "avg_price": round(p.avg_price, 4), "kind": "equity", "isin": None,
-             "value": None, "unrealized_pnl": None}
+             "value": None, "unrealized_pnl": None,
+             "id": None, "close_kind": "equity", "close_symbol": p.symbol,
+             "close_pending": {"kind": "equity", "symbol": p.symbol} in pending}
             for p in equity_positions
         ]
+        overrides = store().get_meta("exit_overrides") or {}
         for o in open_opts:
             kind = o.get("instrument_type") or "option"
+            entry, n = o.get("entry_premium", 0.0), o.get("contracts", 0.0)
+            # Same effective exits the engine uses (core/exits.py).
+            plan = exit_plan(o, settings.options, overrides.get(str(o.get("id"))), OPTION_FEE)
+            arm_pnl = (round(plan.trail_min / (1 - plan.trail_pct), 4)
+                       if 0 <= plan.trail_pct < 1 else None)
+
+            def net_if(price: float | None) -> float | None:
+                # what would be booked if closed at `price`: both 1 EUR fees out
+                return None if price is None else round(pnl_for_premium(entry, n, price,
+                                                                        OPTION_FEE), 4)
+
+            def rnd(v: float | None) -> float | None:
+                return None if v is None else round(v, 4)
             label = f"{o['underlying']} {o.get('kind', '')}".strip()
             # Live mark persisted by the engine each cycle; None until the
             # first cycle marks this option (don't fabricate a P&L).
@@ -172,6 +195,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "isin": o.get("isin"),
                 "value": mark.get("value") if mark else None,
                 "unrealized_pnl": mark.get("unrealized_pnl") if mark else None,
+                "tp_price": rnd(plan.tp), "tp_pnl": net_if(plan.tp),
+                "sl_price": rnd(plan.sl), "sl_pnl": net_if(plan.sl),
+                "trail": {
+                    "enabled": plan.trail_enabled,
+                    "min_pnl": plan.trail_min, "pct": plan.trail_pct,
+                    "arm_pnl": arm_pnl,
+                    "active": bool(plan.trail_enabled and mark and mark.get("trail_active")),
+                    "stop_pnl": mark.get("trail_stop_pnl") if mark and plan.trail_enabled else None,
+                    "peak_pnl": mark.get("peak_pnl") if mark and plan.trail_enabled else None,
+                },
+                "exits_custom": plan.custom,
+                "id": o.get("id"), "close_kind": "option", "close_symbol": None,
+                "close_pending": {"kind": "option", "id": o.get("id")} in pending,
             })
         return SafeJSONResponse({
             "mode": store().get_meta("mode", settings.mode),
@@ -390,6 +426,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if restarting:
             _schedule_restart()
         return SafeJSONResponse({**result, "restarting": restarting})
+
+    @app.post("/api/positions/close")
+    def close_position(payload: dict) -> JSONResponse:
+        """Queue a manual close; the engine executes it at the current price
+        within seconds (Engine.process_close_requests)."""
+        payload = payload or {}
+        kind = payload.get("kind")
+        if kind == "option" and isinstance(payload.get("id"), int):
+            req: dict = {"kind": "option", "id": payload["id"]}
+        elif kind == "equity" and isinstance(payload.get("symbol"), str) and payload["symbol"]:
+            req = {"kind": "equity", "symbol": payload["symbol"]}
+        else:
+            return SafeJSONResponse(
+                {"queued": False,
+                 "error": "expected {kind:'option', id:int} or {kind:'equity', symbol:str}"},
+                status_code=400)
+        reqs = store().get_meta("close_requests") or []
+        if req not in reqs:
+            store().set_meta("close_requests", reqs + [req])
+        return SafeJSONResponse({"queued": True, "request": req})
+
+    @app.post("/api/positions/exits")
+    def set_position_exits(payload: dict) -> JSONResponse:
+        """Save (or reset) a position's own TP / SL / trailing settings, in net
+        EUR. The engine applies them from its next exit check."""
+        payload = payload or {}
+        pid = payload.get("id")
+        o = next((x for x in store().open_options() if x["id"] == pid), None)
+        if o is None:
+            return SafeJSONResponse({"ok": False, "error": "no open position with that id"},
+                                    status_code=404)
+        overrides = store().get_meta("exit_overrides") or {}
+        if payload.get("reset"):
+            overrides.pop(str(pid), None)
+            store().set_meta("exit_overrides", overrides)
+            return SafeJSONResponse({"ok": True, "reset": True})
+        ov, err = validate_override(o, payload, OPTION_FEE)
+        if err:
+            return SafeJSONResponse({"ok": False, "error": err}, status_code=400)
+        overrides[str(pid)] = ov
+        store().set_meta("exit_overrides", overrides)
+        return SafeJSONResponse({"ok": True, "override": ov})
 
     @app.post("/api/dismiss-provider-warning")
     def dismiss_provider_warning() -> JSONResponse:
