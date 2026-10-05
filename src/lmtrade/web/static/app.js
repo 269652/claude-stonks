@@ -753,5 +753,22 @@ $("settings-overlay").addEventListener("click", (e) => {
   if (e.target.id === "settings-overlay") $("settings-overlay").classList.remove("show");
 });
 
-refresh();
-setInterval(refresh, 5000);
+// Refresh loop: the next refresh is scheduled REFRESH_MS after the previous
+// one FINISHED, and the header ring restarts at that moment — so a full ring
+// always coincides with fresh data (no second, drifting clock).
+const REFRESH_MS = 5000;
+let refreshTimer = null;
+function restartRing() {
+  const ring = document.querySelector(".ring-progress");
+  if (!ring) return;
+  ring.style.animation = "none";
+  void ring.getBoundingClientRect();          // restart the CSS animation
+  ring.style.animation = `ringfill ${REFRESH_MS}ms linear forwards`;
+}
+async function refreshLoop() {
+  clearTimeout(refreshTimer);
+  await refresh();
+  restartRing();
+  refreshTimer = setTimeout(refreshLoop, REFRESH_MS);
+}
+refreshLoop();

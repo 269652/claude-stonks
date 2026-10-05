@@ -83,7 +83,7 @@
   .chart-tip .neg, #watchlist .neg { color:var(--red); }
   .refresh { display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
   .ring { width:18px; height:18px; }
-  .ring-progress { animation:ringfill 5s linear infinite; }
+  .ring-progress { stroke-dashoffset:50.27; }   /* restarted on every refresh (restartRing) */
   @keyframes ringfill { from { stroke-dashoffset:50.27; } to { stroke-dashoffset:0; } }
   .badge { cursor:pointer; user-select:none; }
   .armwrap { display:none; align-items:center; gap:8px; font-size:12px; }
