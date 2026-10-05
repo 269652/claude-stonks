@@ -5,19 +5,20 @@
 
 ![Paper trading dashboard](https://raw.githubusercontent.com/269652/LMTrade/bot-state/state/dashboard.png)
 
-A **self-sustaining trading bot** that fuses **LLMs, SLMs and classical financial
-models** into one decision, and is designed to **pay for its own GPU costs**.
+A trading bot that fuses **LLMs, SLMs and classical financial models** into one
+decision, built around the goal of **paying for its own GPU costs**. Whether it
+reaches that goal is measured by the bot itself — it has not been demonstrated.
 
 It runs on a rented [Vast.ai](https://vast.ai) GPU, serves a small language model
 locally (via Ollama), consults a cloud LLM for hard calls, and uses **Perplexity**
 for web-grounded research. A cost-accounting core continuously measures the
-hourly GPU burn against realised P&L and **halts trading when the runway runs
-out** — that guardrail is what turns "pays for its own GPU" from a slogan into an
-enforced rule.
+hourly GPU burn against realised P&L and **halts new entries when the runway
+runs out**, so the bot can't spend its account on compute.
 
 > **Safety first.** LMTrade runs in **paper mode** by default (simulated fills,
-> no real money). Live Trade Republic execution is an explicit, guarded opt-in —
-> see the honest caveats in [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md).
+> no real money). Live Trade Republic execution is an explicit, guarded opt-in
+> through the dashboard — see [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md)
+> for the risks and for what has (and hasn't) been verified against a real account.
 
 ## Fork this and run your own
 
@@ -41,7 +42,7 @@ document every available setting.
 |-------|--------|--------------|
 | **CLI** | `lmtrade.cli` | `run`, `backtest`, `web`, `viz`, `status`, `analyze`, `deploy`, `reset`, `config`, `import-news`, `import-analysis`, `export-ledger` |
 | **Backtest** | `backtest.walk_forward` | Walk-forward folds over historical bars; pre-trains the genome population |
-| **Web dashboard** | `lmtrade.web` | Portfolio, economics, trades, options, leaderboard, benchmark, news, logs |
+| **Web dashboard** | `lmtrade.web` | Positions (price, P&L, exits, close), watchlist, signals, news, analysis, equity curve, trades, logs, settings |
 | **Inline viz** | `lmtrade.viz` | Notebook-native matplotlib dashboard (Colab/Jupyter) + `lmtrade viz` PNG |
 | **Engine** | `core.engine` | High-cadence loop: research jobs → data → economics gate → fusion+strategy → options/equity execution |
 | **Options** | `finance.options` | Black-Scholes pricing/greeks, synthetic near-ATM chain, mark-to-market |
@@ -51,9 +52,41 @@ document every available setting.
 | **Fusion** | `agents.fusion` | Weighted vote: financial models + SLM + LLM + news sentiment + learned strategy |
 | **Models** | `models.providers` | Heuristic (financial), local SLM (Ollama), cloud LLM, Perplexity research |
 | **Finance** | `finance.*` | SMA/EMA/RSI/MACD indicators, position sizing, stop-loss/take-profit |
-| **Brokers** | `brokers.*` | `PaperBroker` (default) + guarded Trade Republic adapter |
+| **Brokers** | `brokers.*` | `PaperBroker` (default) + Trade Republic adapter (knockouts, limit/market orders, armed from the dashboard) |
 | **Economics** | `economics.cost_accounting` | GPU burn accrual, runway, self-sustaining check, spend guardrail |
 | **Infra** | `infra.vast` + `scripts/deploy_vast.sh` | Vast.ai GPU provisioning & pricing |
+
+## Trading mechanics
+
+What the engine does each cycle, all configurable in `config/default.yaml`
+(overridable in `config.toml` or the dashboard's ⚙ settings):
+
+- **Fees in every number.** Trade Republic's flat €1 per order is charged on
+  entry and exit. Position P&L is net of the entry fee; realized P&L of both;
+  net worth is cash + positions after the exit fee each would still cost.
+- **Fee guard.** Entries whose fee would exceed `risk.max_fee_pct` (default 1%)
+  of the order are skipped — i.e. no order below €100 at the defaults. Small
+  signals are raised to that minimum when the position and cash caps allow it.
+- **Watch-list timing.** A signal isn't bought at once: it waits until the
+  price is `entry.watch_k` standard deviations from the intraday average in its
+  favour (below for buys, above for sells), up to `watch_max_hours`. Only
+  symbols with a matching Trade Republic knockout are watched when TR is
+  connected. Signals at or above `instant_confidence` skip the wait.
+- **Limit entries** (`entry.limit_orders`). A watched signal gets a resting
+  limit order at the trigger price, re-priced when the target drifts, cancelled
+  when the signal goes away. Volatile symbols (`market_above_sigma_pct`) use a
+  market order on trigger instead. Paper mode simulates the fills.
+- **Exits.** Take-profit / stop-loss per position, a trailing take-profit with a
+  minimum-profit floor (`options.trail_*`: arms at min ÷ (1 − pct), closes pct
+  below the peak profit — not guaranteed, see below), stale-position eviction, and a manual Close button.
+  TP / SL / trailing can be edited per position. Open positions are re-checked
+  every `loop.exit_check_seconds` (default 10s); a fast move between two checks
+  can still close below a level.
+- **Profit stash.** `economics.profit_stash_pct` of each realized profit is
+  moved out of tradeable cash (still counted in net worth).
+
+These rules are covered by the offline test suite. None of them has been shown
+to make money.
 
 ## The self-sustaining loop
 
@@ -66,8 +99,8 @@ document every available setting.
 
 Every cycle the engine computes **runway** = spare net worth ÷ GPU $/hr. If it
 drops below the configured floor (`min_runway_hours`), new entries are halted and
-only exits are managed, so the bot can't bleed its account dry paying for its own
-compute. It reports itself **self-sustaining** once cumulative P&L covers all
+only exits are managed, so the bot stops opening positions it would have to fund
+from a shrinking account. It reports itself **self-sustaining** once cumulative P&L covers all
 GPU + inference spend.
 
 ## Quick start
@@ -190,12 +223,12 @@ OLLAMA_HOST=http://localhost:11434
 LMTRADE_SLM_MODEL=qwen2.5:1.5b
 ```
 
-#### Trade Republic (paper trading on real instruments)
+#### Trade Republic (real instruments, optional live execution)
 
-With TR credentials the bot selects **real TR knockout certificates** (real
-ISINs, real barrier pricing) for its paper trades — **no orders are ever
-placed**. This is optional; without credentials you get synthetic Black-Scholes
-options instead.
+With TR credentials the bot uses **real TR knockout certificates** (real ISINs,
+priced from TR's live quotes) for its trades. In paper mode nothing is sent to
+TR. Real orders are only placed after you switch the dashboard to **LIVE** and
+arm live execution. Without credentials you get synthetic Black-Scholes options.
 
 1. Install the extra:
    ```bash
@@ -221,10 +254,9 @@ options instead.
    use_derivatives = true
    ```
 
-> ⚠️ **Live execution** (real orders) is an entirely separate, guarded opt-in
-> beyond this. Read [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md) before
-> considering it — it requires removing a deliberate code guard and is against
-> TR's Terms of Service.
+> ⚠️ **Live execution** (real orders) is against TR's Terms of Service and only
+> partly verified against a real account. Read
+> [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md) before arming it.
 
 #### Vast.ai GPU (run the SLM 24/7)
 
@@ -354,7 +386,10 @@ pytest
 ```
 
 The suite runs the whole stack end-to-end in paper mode with **no network and no
-API keys**.
+API keys** (external services and Trade Republic are faked). Two tests are
+currently flaky: `test_engine_opens_option_with_genome_attribution` (randomness
+in a short simulated run) and `test_latest_news_roundtrip` (same-second
+timestamps). Some dashboard logic is tested through Node when it's installed.
 
 ## Walk-forward backtesting
 
@@ -378,9 +413,9 @@ The bot maintains a population of strategy **genomes** (momentum, mean-reversion
 breakout — each with mutable parameters). Every cycle the epsilon-greedy
 optimizer picks a genome whose signal is fused with the model votes; every
 closed trade's realized P&L is attributed back to its genome; every N closed
-trades the worst performer is replaced by a **mutated copy of the best**. With
-persistent state this runs for months of paper training, and `lmtrade status` /
-the dashboard show the live leaderboard. A **daily Claude review** additionally
+trades the worst performer is replaced by a **mutated copy of the best**. State
+persists across restarts, and `lmtrade status` / the dashboard show the
+leaderboard. A **daily Claude review** additionally
 adjusts risk parameters inside hard safety clamps, and **hourly Perplexity news**
 feeds sentiment into every decision.
 
@@ -402,14 +437,18 @@ proportionally more P&L before the bot counts as self-sustaining.
 
 - **True HFT is impossible on Trade Republic.** No official API exists; the
   unofficial mobile API has seconds-to-minutes latency and no options chains.
-  LMTrade is a *high-cadence intraday* bot (seconds-scale cycles), and its
-  options layer is synthetic Black-Scholes pricing for paper trading — read
-  [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md) before even thinking about
-  live mode.
-- **€10 is tiny.** A flat ~€1 equity order fee is a 10% round-trip drag; the
-  paper broker models it so P&L is honest. Covering a GPU bill on top is
-  genuinely hard — the economics layer is built to be honest about that, not to
-  pretend otherwise.
+  LMTrade is an *intraday* bot: a full decision pass over the default 30-symbol
+  universe takes a few minutes. Without TR credentials its options are
+  synthetic Black-Scholes prices — read
+  [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md) before thinking about live mode.
+- **Small accounts.** With €1 per order, the default fee guard needs orders of
+  €100+, so a €300 account holds one or two positions at a time. Covering a GPU
+  bill on top is genuinely hard — the economics layer reports that honestly.
+- **Live execution is only partly verified** — see the list in
+  [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md#what-has-and-hasnt-been-verified-against-a-real-account).
+- **Windows:** a settings save in the dashboard restarts the engine by re-running
+  its command line; that re-launch fails when the engine was started via the
+  `lmtrade` console script. Start it with a Python script path instead.
 - **No performance guarantees.** "Outperform retail" and "self-sustaining in
   3–6 months" are goals the benchmark and economics layers *measure*; nothing
   here promises returns. This is a framework and research tool, not financial
