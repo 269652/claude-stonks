@@ -191,6 +191,21 @@
     </div>
   </div>
 </div>
+<div id="paper-switch-overlay" class="overlay">
+  <div class="modal" style="width:min(460px,100%)">
+    <h2>Switch to paper view</h2>
+    <div style="font-size:13px; margin:8px 0 12px;">Live execution is <b>armed</b>.
+      Keep the bot trading real money in the background while you look at the
+      paper book, or disarm it now?</div>
+    <label style="font-size:12px; color:var(--muted);">
+      <input type="checkbox" id="ps-remember"> Remember my choice</label>
+    <div class="modal-actions">
+      <button class="btn" id="ps-cancel">Cancel</button>
+      <button class="btn" id="ps-disarm">Disarm</button>
+      <button class="btn primary" id="ps-keep">Keep live trading</button>
+    </div>
+  </div>
+</div>
 <div id="exits-overlay" class="overlay">
   <div class="modal" style="width:min(480px,100%)">
     <h2 id="exits-title">Exits</h2>

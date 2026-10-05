@@ -346,10 +346,13 @@ class TestControlPlane:
         cclient.post("/api/control/disarm")
         assert cclient.get("/api/control").json()["armed"] is False
 
-    def test_switch_back_to_paper_disarms(self, cclient):
+    def test_switch_back_to_paper_keeps_armed_unless_disarm(self, cclient):
         cclient.post("/api/control/mode", json={"mode": "live"})
         cclient.post("/api/control/arm", json={"confirm": True})
         cclient.post("/api/control/mode", json={"mode": "paper"})
+        assert cclient.get("/api/control").json()["armed"] is True
+        cclient.post("/api/control/mode", json={"mode": "live"})
+        cclient.post("/api/control/mode", json={"mode": "paper", "disarm": True})
         assert cclient.get("/api/control").json()["armed"] is False
 
 

@@ -32,7 +32,10 @@ class ControlState:
                  double_armed: bool = False):
         self.path = path
         self.mode = mode if mode in _VALID_MODES else "paper"
-        self.armed = bool(armed) and self.mode == "live"
+        # `mode` is the dashboard VIEW; `armed` alone decides real trading, so
+        # it survives switching the view to paper (arming itself still
+        # requires the live view, see arm()).
+        self.armed = bool(armed)
         # Second guard is meaningless unless the first guard is armed.
         self.double_armed = bool(double_armed) and self.armed
 
@@ -58,12 +61,14 @@ class ControlState:
                 "double_armed": self.double_armed}
 
     # -- transitions ---------------------------------------------------------
-    def set_mode(self, mode: str) -> None:
+    def set_mode(self, mode: str, disarm: bool = False) -> None:
+        """Switch the dashboard view. Live trading keeps running unless
+        `disarm` (the dashboard asks when switching to paper)."""
         if mode not in _VALID_MODES:
             raise ValueError(f"invalid mode {mode!r}; expected one of {_VALID_MODES}")
         self.mode = mode
-        if mode != "live":
-            self.armed = False        # leaving live must never stay armed
+        if disarm:
+            self.armed = False
             self.double_armed = False
         self._save()
 
@@ -105,7 +110,7 @@ class ControlState:
     def live_armed(self) -> bool:
         """First guard: whether the LIVE (real) broker is used at all. The
         low-balance second guard is enforced per-order via is_executing()."""
-        return self.mode == "live" and self.armed
+        return self.armed
 
     def low_balance_blocks(self, net_worth: float | None) -> bool:
         """True when a real order must be blocked purely because the balance is

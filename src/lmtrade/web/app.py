@@ -488,7 +488,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         mode = (payload or {}).get("mode")
         c = control()
         try:
-            c.set_mode(mode)
+            c.set_mode(mode, disarm=bool((payload or {}).get("disarm")))
         except ValueError:
             return SafeJSONResponse({"error": f"invalid mode {mode!r}"}, status_code=400)
         return SafeJSONResponse(_control_payload(c, _live_net_worth()))

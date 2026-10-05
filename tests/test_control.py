@@ -47,13 +47,24 @@ class TestModeSwitch:
         assert c.mode == "live"
         assert c.armed is False        # live view, still simulated until armed
 
-    def test_switch_back_to_paper_disarms(self, path):
+    def test_switch_to_paper_keeps_live_armed_by_default(self, path):
+        # The badge only switches the VIEW; live trading keeps running unless
+        # the user chooses to disarm (dashboard prompts and remembers).
         c = ControlState.load(path)
         c.set_mode("live")
         c.arm(confirm=True)
-        assert c.armed is True
+        c.set_double_armed(confirm=True)
         c.set_mode("paper")
-        assert c.armed is False        # leaving live must never leave it armed
+        assert c.armed is True and c.double_armed is True and c.live_armed is True
+        again = ControlState.load(path)
+        assert again.mode == "paper" and again.armed is True and again.live_armed is True
+
+    def test_switch_to_paper_with_disarm(self, path):
+        c = ControlState.load(path)
+        c.set_mode("live")
+        c.arm(confirm=True)
+        c.set_mode("paper", disarm=True)
+        assert c.armed is False and c.double_armed is False and c.live_armed is False
 
     def test_invalid_mode_rejected(self, path):
         c = ControlState.load(path)
@@ -133,10 +144,12 @@ class TestSecondGuard:
         c.disarm()
         assert c.double_armed is False
 
-    def test_switching_to_paper_clears_both(self, path):
+    def test_switching_to_paper_with_disarm_clears_both(self, path):
+        # Plain view switches keep both guards (see TestModeSwitch); the
+        # explicit disarm choice clears both.
         c = self._armed_live(path)
         c.set_double_armed(confirm=True)
-        c.set_mode("paper")
+        c.set_mode("paper", disarm=True)
         assert c.armed is False and c.double_armed is False
 
 

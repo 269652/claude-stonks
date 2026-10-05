@@ -64,10 +64,26 @@ function paintControl(ctrl, s) {
   $("arm2-toggle").checked = !!ctrl.double_armed;
 
   // IS / IS-NOT executing real orders banner — the single most important
-  // status in live mode. Hidden entirely in paper mode.
+  // status in live mode. In the paper VIEW it only appears while live is
+  // still armed (the engine keeps trading real money in the background).
   const b = $("exec-banner");
-  b.classList.toggle("show", isLive);
-  if (isLive) {
+  b.classList.toggle("show", isLive || !!ctrl.armed);
+  if (!isLive && ctrl.armed) {
+    b.className = "exec-banner show exec-live";
+    $("exec-ic").textContent = "🔴";
+    const remembered = (() => { try { return localStorage.getItem("paperSwitchChoice"); }
+                                catch (e) { return null; } })();
+    $("exec-text").innerHTML = "<b>Live trading still armed</b> — the bot keeps placing real "
+      + "Trade Republic orders while you view paper. Switch to LIVE to watch or disarm it."
+      + (remembered ? ` <a href="#" id="ps-reset" style="color:var(--blue)">(remembered: `
+         + `${remembered === "keep" ? "keep live" : "disarm"} — ask again)</a>` : "");
+    const reset = document.getElementById("ps-reset");
+    if (reset) reset.onclick = ev => {
+      ev.preventDefault();
+      try { localStorage.removeItem("paperSwitchChoice"); } catch (e) {}
+      refresh();
+    };
+  } else if (isLive) {
     if (ctrl.executing) {
       b.className = "exec-banner show exec-live";
       $("exec-ic").textContent = "🔴";
@@ -601,12 +617,43 @@ async function postJSON(path, body) {
 $("mode").addEventListener("click", async () => {
   const ctrl = window._ctrl || {mode: "paper"};
   const next = ctrl.mode === "live" ? "paper" : "live";
-  if (next === "live" &&
+  if (next === "live" && !ctrl.armed &&
       !confirm("Switch to LIVE mode?\n\nThis shows your real Trade Republic " +
                "account. Execution stays SIMULATED until you separately arm it.")) return;
-  await postJSON("/api/control/mode", {mode: next});
+  let disarm = false;
+  if (next === "paper" && ctrl.armed) {
+    // Switching the view to paper doesn't stop live trading by itself: ask
+    // (or use the remembered answer).
+    const choice = await paperSwitchChoice();
+    if (choice === null) return;                 // cancelled
+    disarm = choice === "disarm";
+  }
+  await postJSON("/api/control/mode", {mode: next, disarm: disarm});
   refresh();
 });
+
+// "Keep live trading" / "Disarm" when switching to paper while armed;
+// optionally remembered in this browser (reset from the banner).
+function paperSwitchChoice() {
+  let saved = null;
+  try { saved = localStorage.getItem("paperSwitchChoice"); } catch (e) {}
+  if (saved === "keep" || saved === "disarm") return Promise.resolve(saved);
+  return new Promise(resolve => {
+    const ov = $("paper-switch-overlay");
+    $("ps-remember").checked = false;
+    ov.classList.add("show");
+    const done = choice => {
+      ov.classList.remove("show");
+      if (choice && $("ps-remember").checked) {
+        try { localStorage.setItem("paperSwitchChoice", choice); } catch (e) {}
+      }
+      resolve(choice);
+    };
+    $("ps-keep").onclick = () => done("keep");
+    $("ps-disarm").onclick = () => done("disarm");
+    $("ps-cancel").onclick = () => done(null);
+  });
+}
 
 // Arm / disarm real live execution.
 $("arm-toggle").addEventListener("change", async (e) => {

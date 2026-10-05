@@ -118,6 +118,13 @@ def run(
         console.print("\n[yellow]Interrupted — stopping engine.[/yellow]")
 
 
+def _control_key(control) -> tuple:
+    """What the running engine depends on: real trading on/off and which book
+    the paper simulation feeds. Switching only the dashboard VIEW while live
+    stays armed must not rebuild (and so not interrupt) the live engine."""
+    return (control.live_armed, control.live_armed or control.mode)
+
+
 def _build_engine_for_control(settings, control):
     """Construct engine + store + broker for the active book. The LIVE book
     receives ONLY real fills: it is used exclusively when live AND armed
@@ -164,7 +171,7 @@ def _build_engine_for_control(settings, control):
         fallback_store = Store(settings.book_db_path("live"))
     tr = build_tr_derivatives(settings)
     engine = Engine(settings, store, broker, tr_derivatives=tr, fallback_store=fallback_store)
-    if control.mode == "live" and tr is not None:
+    if (control.live_armed or control.mode == "live") and tr is not None:
         # Reconcile the LIVE book against the real TR account at startup —
         # refresh real cash, import untracked TR positions (e.g. after a db
         # reset), delete phantom rows TR doesn't hold. The live view is then
@@ -196,15 +203,14 @@ def _run_with_control(settings, max_cycles):
     remaining = max_cycles
     while True:
         control = ControlState.load(settings.control_path)
-        snapshot = (control.mode, control.armed)
+        snapshot = _control_key(control)
         engine, store = _build_engine_for_control(settings, control)
         _print_diagnostics(settings, engine)
         try:
             engine.run_forever(
                 max_cycles=remaining,
-                rebuild_when=lambda: (
-                    lambda c: (c.mode, c.armed) != snapshot
-                )(ControlState.load(settings.control_path)),
+                rebuild_when=lambda: _control_key(
+                    ControlState.load(settings.control_path)) != snapshot,
             )
         finally:
             store.close()
@@ -212,8 +218,7 @@ def _run_with_control(settings, max_cycles):
                 engine.fallback_store.close()
         # If control is unchanged, run_forever returned because it finished
         # (max_cycles) or was stopped — don't loop forever rebuilding.
-        if (ControlState.load(settings.control_path).mode,
-                ControlState.load(settings.control_path).armed) == snapshot:
+        if _control_key(ControlState.load(settings.control_path)) == snapshot:
             break
 
 
