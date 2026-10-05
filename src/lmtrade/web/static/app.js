@@ -401,7 +401,8 @@ function paintWatchlist(rows) {
   const k = rows.length ? rows[0].k : null;
   $("watch-note").textContent = rows.length
     ? `Entered once price is ${k}σ below (buy → call) or above (sell → put) its intraday average; `
-      + "dropped when the signal disappears or the entry expires."
+      + "dropped when the signal disappears or the entry expires. "
+      + "Ranked by priority = (2 × confidence + closeness) / 3."
     : "";
   const sig = v => v == null ? "—" : (v >= 0 ? "+" : "") + Number(v).toFixed(2) + "σ";
   const left = ts => {
@@ -412,13 +413,22 @@ function paintWatchlist(rows) {
     ? rows.map(r => `<tr><td>${r.symbol}</td>`
         + `<td><span class="${r.direction === "buy" ? "pos" : "neg"}">${r.direction.toUpperCase()}</span>`
         + ` <span class="kind">${r.instrument}</span></td>`
-        + `<td>${fmt(r.confidence)}</td><td>${sig(r.z)}</td><td>${sig(r.trigger_z)}</td>`
+        + `<td>${fmt(r.confidence)}</td>`
+        + `<td>${r.spot == null ? "—" : fmt(r.spot)}</td>`
+        + `<td>${r.target == null ? "—" : fmt(r.target)}</td>`
+        + `<td>${r.distance_pct == null ? "—" : r.distance_pct === 0 ? "<b>reached</b>"
+              : (r.direction === "buy" ? "▼ " : "▲ ") + Number(r.distance_pct).toFixed(2) + "%"}</td>`
+        + `<td>${sig(r.z)}</td><td>${sig(r.trigger_z)}</td>`
         + `<td>${r.sigma_to_go == null ? "—" : r.sigma_to_go === 0 ? "ready" : Number(r.sigma_to_go).toFixed(2) + "σ"}</td>`
         + `<td>${r.order
-              ? `limit ${fmt(r.order.limit)} × ${fmt(r.order.size, 2)}<div class="sub">${r.symbol} @ ${fmt(r.order.target_spot)}${r.order.order_id ? " · " + r.order.order_id : ""}</div>`
-              : `<span class="muted">—</span>`}</td>`
+              ? `limit ${fmt(r.order.limit)} × ${fmt(r.order.size, 2)}`
+                + `<div class="sub">now ${r.order.current_price == null ? "—" : fmt(r.order.current_price)}`
+                + `${r.order.order_id ? " · " + r.order.order_id.slice(0, 8) : ""}</div>`
+              : r.high_vol
+                ? `<span class="muted">market on trigger</span><div class="sub">σ ${Number(r.sigma_pct).toFixed(2)}%</div>`
+                : `<span class="muted">—</span>`}</td>`
         + `<td>${left(r.expires_ts)}</td></tr>`).join("")
-    : `<tr><td colspan="8" class="muted">Nothing on the watchlist — new signals appear here while they wait for a good entry.</td></tr>`;
+    : `<tr><td colspan="11" class="muted">Nothing on the watchlist — new signals appear here while they wait for a good entry.</td></tr>`;
 }
 
 // Watch-list status for a signal: current sigma and how far to the entry.

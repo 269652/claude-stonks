@@ -220,6 +220,7 @@ class FakeTR(PaperBroker):
         self.status: dict | None = {"state": "open", "fill_price": None}
         self.cancel_ok = True
         self._n = 0
+        self.exchanges: list[str] = []
 
     def cash(self):
         return 300.0
@@ -230,6 +231,7 @@ class FakeTR(PaperBroker):
     def place_limit_order(self, isin, side, size, limit, exchange="LSX"):
         self._n += 1
         self.placed.append((isin, side, size, limit))
+        self.exchanges.append(exchange)
         return OrderResult(True, isin, side, size, limit, 1.0, "ok", order_id=f"L{self._n}")
 
     def cancel_order(self, order_id):
@@ -249,10 +251,13 @@ class FakeDerivs:
         strike = 80.0 if kind == "ko_call" else 120.0
         return TRDerivativeQuote(isin="DE000KO0001", underlying=underlying, kind=kind,
                                  strike=strike, barrier=strike, ratio=10.0,   # (S-K)/ratio ~ 2 EUR
-                                 price=2.0, leverage=5.0)
+                                 price=2.0, leverage=5.0, exchange="BHS")
 
     def account_cash(self):
         return None
+
+    def search(self, underlying, direction):
+        return [self.find_knockout(underlying, d, 100.0, 5.0) for d in ("buy", "sell")]
 
 
 @pytest.fixture()
@@ -343,3 +348,98 @@ class TestWatchlistShowsOrders:
         html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
         head = html[html.index('<section id="tab-watchlist"'):]
         assert "<th>Order</th>" in head[:head.index("</tr>")]
+
+
+class TestEntryPriority:
+    """Order slots and the watchlist are ranked by confidence (weight 2) and
+    closeness to entry (weight 1): closeness = 1 / (1 + sigma to go)."""
+
+    def test_formula(self):
+        from lmtrade.core.limit_orders import entry_priority
+        assert entry_priority(0.9, 0.0) == pytest.approx((1.8 + 1.0) / 3)
+        assert entry_priority(0.6, 1.0) == pytest.approx((1.2 + 0.5) / 3)
+
+    def test_confidence_weighs_double(self):
+        from lmtrade.core.limit_orders import entry_priority
+        # strong but 1 sigma away beats weaker but ready
+        assert entry_priority(0.9, 1.0) > entry_priority(0.6, 0.0)
+
+    def test_unknown_distance_counts_as_far(self):
+        from lmtrade.core.limit_orders import entry_priority
+        assert entry_priority(0.9, None) == pytest.approx(1.8 / 3)
+
+    def test_engine_gives_slot_to_higher_priority(self, settings, store):
+        settings.universe = ["AAPL", "MSFT"]
+        settings.budget = 160.0                     # one order fits
+        e, market, _ = make(settings, store)
+        market.price["AAPL"] = 99.6                 # ~0.4 sigma to go
+        market.price["MSFT"] = 99.6
+        confs = {"AAPL": 0.95, "MSFT": 0.6}
+        e._decide = lambda q: (Decision(q.symbol, "buy", confs[q.symbol], "forced"), None)
+        e.run_cycle()
+        assert list(pending(store)) == ["AAPL"]
+
+
+class TestOrdersOnCertificateExchange:
+    def test_limit_order_goes_to_the_certificates_exchange(self, live, store):
+        e, market, tr = live
+        e.run_cycle()
+        assert tr.exchanges == ["BHS"]
+
+
+class TestWatchlistPriceDistance:
+    """Watchlist rows show the underlying's current price, the entry target
+    price, the % distance still to go, and the certificate's current price
+    next to a resting order's limit."""
+
+    def test_engine_records_spot_and_target(self, settings, store):
+        e, market, _ = make(settings, store)
+        force(e)
+        market.price["AAPL"] = 100.5
+        e.run_cycle()
+        w = store.get_meta("watchlist")["AAPL"]
+        assert w["spot"] == pytest.approx(100.5)
+        assert w["target"] < 100.0                      # buy: below the SMA
+        p = pending(store)["AAPL"]
+        assert p["last_price"] > p["limit"]             # cert above its limit: not filled
+
+    def test_api_distance_for_buy_and_reached(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        now = time.time()
+        store.set_meta("watchlist", {
+            "AAPL": {"direction": "buy", "confidence": 0.8, "added_ts": now, "z": 0.3,
+                     "spot": 100.0, "target": 99.0},
+            "MSFT": {"direction": "sell", "confidence": 0.8, "added_ts": now, "z": 0.2,
+                     "spot": 100.0, "target": 101.0},
+            "V": {"direction": "buy", "confidence": 0.8, "added_ts": now, "z": -1.5,
+                  "spot": 98.0, "target": 99.0},
+        })
+        store.set_meta("pending_entries", {"AAPL": {
+            "direction": "buy", "limit": 1.9, "size": 50, "target_spot": 99.0,
+            "last_price": 2.0, "instrument": {"kind": "ko_call"}}})
+        rows = {r["symbol"]: r for r in
+                TestClient(create_app(settings)).get("/api/watchlist").json()}
+        assert rows["AAPL"]["spot"] == 100.0 and rows["AAPL"]["target"] == 99.0
+        assert rows["AAPL"]["distance_pct"] == pytest.approx(1.0)     # must fall 1%
+        assert rows["MSFT"]["distance_pct"] == pytest.approx(1.0)     # must rise 1%
+        assert rows["V"]["distance_pct"] == 0.0                        # already reached
+        assert rows["AAPL"]["order"]["current_price"] == pytest.approx(2.0)
+
+    def test_api_distance_unknown_without_prices(self, settings, store):
+        from fastapi.testclient import TestClient
+
+        from lmtrade.web.app import create_app
+        store.set_meta("watchlist", {"AAPL": {"direction": "buy", "confidence": 0.8,
+                                              "added_ts": time.time(), "z": None}})
+        row = TestClient(create_app(settings)).get("/api/watchlist").json()[0]
+        assert row["spot"] is None and row["distance_pct"] is None
+
+    def test_tab_has_price_target_distance_columns(self):
+        web = Path(__file__).parents[1] / "src" / "lmtrade" / "web"
+        html = (web / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        head = html[html.index('<section id="tab-watchlist"'):]
+        head = head[:head.index("</tr>")]
+        for col in ("<th>Price</th>", "<th>Target</th>", "<th>Distance</th>"):
+            assert col in head

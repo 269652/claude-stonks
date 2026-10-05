@@ -46,6 +46,7 @@ class TradeRepublicBroker(Broker):
             )
         self._api = None
         self._next_retry = 0.0
+        self.last_cash_ok = False   # did the most recent cash() read succeed?
 
     def _invalidate(self) -> None:
         """Drop the session and back off, so a refreshed cookie (after the
@@ -91,24 +92,35 @@ class TradeRepublicBroker(Broker):
 
     # -- balances ------------------------------------------------------------
     def cash(self) -> float:
-        """Real TR account cash (account currency). 0.0 if unreachable."""
+        """Real TR account cash (account currency). 0.0 if unreachable — check
+        `last_cash_ok` to tell a real zero from a failed read."""
+        self.last_cash_ok = False
         api = self._login()
         if api is None:
             return 0.0
         try:
             import asyncio
 
-            async def _q() -> Any:
-                sub_id = await api.cash()
-                _, _, payload = await api.recv()
-                await api.unsubscribe(sub_id)
-                return payload
+            from .tr_derivatives import _recv_for
 
-            return _parse_cash(asyncio.get_event_loop().run_until_complete(_q())) or 0.0
+            async def _q() -> Any:
+                # Match OUR subscription (the shared socket carries other
+                # frames too) and never wait forever.
+                sub_id = await api.cash()
+                try:
+                    return await _recv_for(api, sub_id, timeout=10.0)
+                finally:
+                    await api.unsubscribe(sub_id)
+
+            value = _parse_cash(asyncio.get_event_loop().run_until_complete(_q()))
         except Exception as exc:  # noqa: BLE001
             log.warning("TR cash fetch failed (%s) — dropping session.", exc)
             self._invalidate()
             return 0.0
+        if value is None:
+            return 0.0
+        self.last_cash_ok = True
+        return value
 
     def price(self, symbol: str) -> float:
         return 0.0  # engine passes live prices from the data layer

@@ -23,6 +23,7 @@ Honest operational caveats, written down so nobody is surprised later:
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -71,17 +72,31 @@ def drop_shared_api(phone: str) -> None:
     _SHARED_APIS.pop(phone, None)
 
 
-async def _recv_for(api: Any, sub_id: Any, max_frames: int = 10) -> Any:
+async def _recv_for(api: Any, sub_id: Any, max_frames: int = 10,
+                    timeout: float = 20.0) -> Any:
     """Receive until the frame for OUR subscription arrives. With the shared
     websocket, recv() can hand back another consumer's frame first — matching
     on subscription id prevents e.g. an order path consuming a ticker frame
-    (or vice versa) and misreading it as its own response."""
+    (or vice versa) and misreading it as its own response.
+
+    Bounded by `timeout` seconds overall: a subscription TR never answers
+    once froze the whole engine (no decisions, no exit checks)."""
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
     for _ in range(max_frames):
-        rid, _, payload = await api.recv()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            rid, _, payload = await asyncio.wait_for(api.recv(), remaining)
+        except asyncio.TimeoutError:
+            break
         if str(rid) == str(sub_id):
             return payload
     raise RuntimeError(f"no response for subscription {sub_id} "
-                       f"within {max_frames} frames")
+                       f"within {timeout:g}s / {max_frames} frames")
 
 
 def _resume_once(api: Any) -> bool:
@@ -121,9 +136,11 @@ class TRDerivativeQuote:
     strike: float
     barrier: float
     ratio: float
-    price: float         # ask per certificate
+    price: float         # ask per certificate (0 until quoted — search has no prices)
     leverage: float
     issuer: str = ""
+    currency: str = "EUR"   # currency of strike / barrier (the underlying's)
+    exchange: str | None = None   # venue the certificate trades on (issuer's, not LSX)
 
 
 def _parse_cash(payload: Any) -> float | None:
@@ -151,8 +168,22 @@ def _parse_cash(payload: Any) -> float | None:
 class TRDerivativesBase:
     """Interface: find the best-fitting real KO instrument for a signal."""
 
+    # How many leverage-ranked candidates to request a live quote for, and how
+    # long to wait for each quote before treating it as unavailable.
+    QUOTE_TRIES = 5
+    QUOTE_TIMEOUT_S = 5.0
+
     def available(self) -> bool:
         raise NotImplementedError
+
+    def quote_ask(self, isin: str) -> float | None:
+        """Live ask for a certificate. None when unavailable — the knockout
+        search itself carries no prices."""
+        return None
+
+    def exchange_for(self, isin: str) -> str | None:
+        """Venue a certificate trades on. None when unknown."""
+        return None
 
     def search(self, underlying: str, direction: str) -> list[TRDerivativeQuote]:
         raise NotImplementedError
@@ -170,16 +201,46 @@ class TRDerivativesBase:
         reconcile (delete local rows) against it."""
         return None
 
+    def _log_filter_rejections(self, underlying: str, kind: str,
+                               results: list[TRDerivativeQuote], no_quote: int = 0) -> None:
+        """Say WHY no instrument qualified (once per symbol per hour), with one
+        raw TR result, so the response field mapping can be fixed against the
+        real payload instead of silently finding nothing."""
+        logged: dict = self.__dict__.setdefault("_filter_diag_ts", {})
+        if time.time() - logged.get(underlying, 0.0) < 3600:
+            return
+        logged[underlying] = time.time()
+        wrong_kind = sum(q.kind != kind for q in results)
+        bad_lev = sum(not MIN_LEVERAGE <= q.leverage <= MAX_LEVERAGE for q in results)
+        raw = (self.__dict__.get("_raw_sample") or {}).get(underlying)
+        log.warning(
+            "TR %s: no knockout qualified out of %d — wrong kind: %d, leverage outside "
+            "%.0f-%.0f: %d, no ask quote: %d (of the top %d tried). Raw first result: %s",
+            underlying, len(results), wrong_kind, MIN_LEVERAGE, MAX_LEVERAGE, bad_lev,
+            no_quote, self.QUOTE_TRIES,
+            None if raw is None else {k: raw[k] for k in list(raw)[:30]})
+
     def find_knockout(self, underlying: str, direction: str, spot: float,
                       target_leverage: float) -> TRDerivativeQuote | None:
         """Best instrument = tradeable leverage closest to target, within the
         sane retail band."""
         kind = "ko_call" if direction == "buy" else "ko_put"
-        candidates = [q for q in self.search(underlying, direction)
-                      if q.kind == kind and q.price > 0
-                      and MIN_LEVERAGE <= q.leverage <= MAX_LEVERAGE]
-        if not candidates:
-            return None
+        results = self.search(underlying, direction)
+        candidates = sorted((q for q in results
+                             if q.kind == kind and MIN_LEVERAGE <= q.leverage <= MAX_LEVERAGE),
+                            key=lambda q: abs(q.leverage - target_leverage))
+        no_quote = 0
+        for q in candidates[:self.QUOTE_TRIES]:
+            if q.price > 0:
+                return q
+            ask = self.quote_ask(q.isin)
+            if ask is not None and ask > 0:
+                return dataclasses.replace(q, price=ask,
+                                           exchange=q.exchange or self.exchange_for(q.isin))
+            no_quote += 1
+        if results:
+            self._log_filter_rejections(underlying, kind, results, no_quote)
+        return None
         return min(candidates, key=lambda q: abs(q.leverage - target_leverage))
 
 
@@ -313,24 +374,29 @@ class PytrDerivatives(TRDerivativesBase):
                 return await self._fetch_derivatives(api, isin)
 
             items = asyncio.get_event_loop().run_until_complete(_query())
+            if items and isinstance(items[0], dict):
+                self.__dict__.setdefault("_raw_sample", {})[underlying] = items[0]
             out: list[TRDerivativeQuote] = []
             first_error: Exception | None = None
             for item in items:
                 try:
+                    # Direction from TR's own optionType (long/short) — never
+                    # from the requested direction: labelling every result by
+                    # the request could buy a short turbo on a buy signal.
+                    kind = {"long": "ko_call", "short": "ko_put"}[
+                        str(item["optionType"]).lower()]
+                    size = item.get("size")
+                    ratio = 1.0 / float(size) if size else float(item["ratio"])
                     out.append(TRDerivativeQuote(
-                        isin=item["isin"], underlying=underlying,
-                        # Every result from this query is labeled with the
-                        # requested direction rather than an actual call/put
-                        # field from the response (unconfirmed field name) —
-                        # a pre-existing simplification, not new here.
-                        kind="ko_call" if direction == "buy" else "ko_put",
+                        isin=item["isin"], underlying=underlying, kind=kind,
                         strike=float(item["strike"]),
-                        barrier=float(item.get("barrier", item["strike"])),
-                        ratio=float(item.get("ratio", 1.0) or 1.0),
-                        price=float(item.get("ask", 0) or 0),
+                        barrier=float(item.get("barrier") or item["strike"]),
+                        ratio=ratio,
+                        price=float(item.get("ask", 0) or 0),   # search has no prices
                         leverage=float(item.get("leverage", 0) or 0),
-                        issuer=str(item.get("issuerDisplayName", ""))))
-                except (KeyError, TypeError, ValueError) as exc:
+                        issuer=str(item.get("issuerDisplayName", "")),
+                        currency=str(item.get("currency") or "EUR")))
+                except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
                     if first_error is None:
                         first_error = exc
                     continue  # tolerate payload drift per-instrument
@@ -361,6 +427,75 @@ class PytrDerivatives(TRDerivativesBase):
                         "will re-login.", exc)
             self._invalidate()
             return []
+
+    def exchange_for(self, isin: str) -> str | None:
+        """The certificate's venue from TR's instrument details (issuer
+        venues for knockouts — TR never answers LSX tickers for them). LSX
+        preferred when listed. Cached; None when unknown."""
+        cache = self.__dict__.setdefault("_exchange_cache", {})
+        if isin in cache:
+            return cache[isin]
+        api = self._login()
+        if api is None:
+            return None
+        try:
+            import asyncio
+
+            async def _query() -> Any:
+                sub_id = await api.instrument_details(isin)
+                try:
+                    return await _recv_for(api, sub_id, timeout=self.QUOTE_TIMEOUT_S)
+                finally:
+                    await api.unsubscribe(sub_id)
+
+            payload = asyncio.get_event_loop().run_until_complete(_query())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("TR instrument details %s failed: %s", isin, exc)
+            return None
+        ids: list[str] = []
+        if isinstance(payload, dict):
+            raw_ids = payload.get("exchangeIds")
+            if isinstance(raw_ids, list):
+                ids = [str(x) for x in raw_ids if x]
+            if not ids and isinstance(payload.get("exchanges"), list):
+                for x in payload["exchanges"]:
+                    if isinstance(x, dict):
+                        v = x.get("slug") or x.get("exchangeId") or x.get("id")
+                        if v:
+                            ids.append(str(v))
+        if not ids:
+            log.warning("TR instrument details %s: no exchange found; fields: %s", isin,
+                        sorted(payload.keys()) if isinstance(payload, dict) else type(payload))
+            return None
+        exchange = "LSX" if "LSX" in ids else ids[0]
+        cache[isin] = exchange
+        return exchange
+
+    def quote_ask(self, isin: str) -> float | None:
+        api = self._login()
+        if api is None:
+            return None
+        exchange = self.exchange_for(isin) or "LSX"
+        try:
+            import asyncio
+
+            async def _query() -> Any:
+                sub_id = await api.ticker(isin, exchange)
+                try:
+                    return await _recv_for(api, sub_id, timeout=self.QUOTE_TIMEOUT_S)
+                finally:
+                    await api.unsubscribe(sub_id)
+
+            payload = asyncio.get_event_loop().run_until_complete(_query())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("TR ticker %s failed: %s", isin, exc)
+            return None
+        ask = payload.get("ask") if isinstance(payload, dict) else None
+        try:
+            price = float(ask.get("price")) if isinstance(ask, dict) else None
+        except (TypeError, ValueError):
+            return None
+        return price if price and price > 0 else None
 
     def account_cash(self) -> float | None:
         api = self._login()

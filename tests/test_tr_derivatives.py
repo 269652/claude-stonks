@@ -84,7 +84,9 @@ class FakeAsyncTRApi:
     without ever touching TR's real (websocket) API."""
 
     def __init__(self, resume_ok=True, search_results=None, derivative_results=None,
-                 cash_payload=None):
+                 cash_payload=None, tickers=None, details=None):
+        self._tickers = tickers or {}   # isin -> ticker payload
+        self._details = details or {}   # isin -> instrument_details payload
         self.resume_ok = resume_ok
         self._search_results = (
             search_results if search_results is not None else [{"isin": "US0378331005"}])
@@ -108,12 +110,24 @@ class FakeAsyncTRApi:
         self.calls.append(("cash",))
         return "sub-cash"
 
+    async def ticker(self, isin, exchange="LSX"):
+        self.calls.append(("ticker", isin, exchange))
+        return "sub-ticker"
+
+    async def instrument_details(self, isin):
+        self.calls.append(("instrument_details", isin))
+        return "sub-details"
+
     async def recv(self):
         kind = self.calls[-1][0]
         if kind == "search":
             return ("sub-search", {}, {"results": self._search_results})
         if kind == "cash":
             return ("sub-cash", {}, self._cash_payload)
+        if kind == "ticker":
+            return ("sub-ticker", {}, self._tickers.get(self.calls[-1][1], {}))
+        if kind == "instrument_details":
+            return ("sub-details", {}, self._details.get(self.calls[-1][1], {}))
         return ("sub-deriv", {}, {"results": self._derivative_results})
 
     async def unsubscribe(self, sub_id):
@@ -222,8 +236,8 @@ class TestPytrSearchGlue:
         api = FakeAsyncTRApi(
             search_results=[{"isin": "US0378331005"}],
             derivative_results=[{
-                "isin": "DE000ABC123", "strike": 180.0, "barrier": 180.0,
-                "ratio": 10.0, "ask": 2.5, "leverage": 5.0,
+                "isin": "DE000ABC123", "optionType": "long", "strike": 180.0,
+                "barrier": 180.0, "size": 0.1, "leverage": 5.0, "currency": "USD",
                 "issuerDisplayName": "TestBank",
             }])
         client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
@@ -232,15 +246,25 @@ class TestPytrSearchGlue:
         assert quotes[0].isin == "DE000ABC123"
         assert quotes[0].kind == "ko_call"
         assert quotes[0].leverage == pytest.approx(5.0)
+        assert quotes[0].ratio == pytest.approx(10.0)      # 1 / size
+        assert quotes[0].currency == "USD"
+        assert quotes[0].price == 0.0                      # no price in search
         assert ("search", "AAPL", "stock") in api.calls
         assert ("search_derivative", "US0378331005", "knockOutProduct") in api.calls
 
-    def test_sell_direction_maps_to_ko_put(self):
-        api = FakeAsyncTRApi(
-            derivative_results=[{"isin": "DE1", "strike": 100.0, "ask": 1.0, "leverage": 4.0}])
+    def test_kind_comes_from_option_type_not_the_request(self):
+        # Safety: a BUY search must never label a SHORT turbo as a call.
+        api = FakeAsyncTRApi(derivative_results=[
+            {"isin": "DE1", "optionType": "short", "strike": 100.0, "size": 0.1,
+             "leverage": 4.0}])
         client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
-        quotes = client.search("AAPL", "sell")
-        assert quotes[0].kind == "ko_put"
+        assert client.search("AAPL", "buy")[0].kind == "ko_put"
+
+    def test_missing_option_type_is_skipped(self):
+        api = FakeAsyncTRApi(derivative_results=[
+            {"isin": "DE1", "strike": 100.0, "size": 0.1, "leverage": 4.0}])
+        client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
+        assert client.search("AAPL", "buy") == []
 
     def test_no_isin_match_returns_empty(self):
         api = FakeAsyncTRApi(search_results=[])
@@ -253,7 +277,8 @@ class TestPytrSearchGlue:
             search_results=[{"isin": "US0378331005"}],
             derivative_results=[
                 {"isin": "DE1"},  # missing strike -> skipped
-                {"isin": "DE2", "strike": 50.0, "ask": 1.0, "leverage": 3.0},
+                {"isin": "DE2", "optionType": "long", "strike": 50.0, "size": 0.1,
+                 "leverage": 3.0},
             ])
         client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
         quotes = client.search("AAPL", "buy")
@@ -371,7 +396,8 @@ class TestPytrSearchDiagnostics:
         api = FakeAsyncTRApi(
             search_results=[{"isin": "US0378331005"}],
             derivative_results=[
-                {"isin": "DE1", "strike": 100.0, "ask": 2.0, "leverage": 5.0}])
+                {"isin": "DE1", "optionType": "long", "strike": 100.0, "size": 0.1,
+                 "leverage": 5.0}])
         client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
         with caplog.at_level(logging.INFO, logger="lmtrade.tr"):
             out = client.search("AAPL", "buy")
@@ -776,3 +802,161 @@ class TestEngineIntegration:
                         tr_derivatives=client)
         engine.run_cycle()
         assert store.closed_options(), "knockout fires regardless of min_hold"
+
+
+class TestKnockoutFilterDiagnostics:
+    """Live incident: TR returned thousands of knockouts per symbol but none
+    passed find_knockout's filter (price > 0, leverage in range), silently.
+    The rejection reasons and one raw TR result must be logged so the field
+    mapping can be fixed against the real payload."""
+
+    def test_logs_why_nothing_qualified_with_raw_sample(self, caplog):
+        raw = [{"isin": "DE000X1", "optionType": "long", "strike": 80.0, "barrier": 80.0,
+                "size": 0.1, "leverage": 5.0, "someOtherField": 1}]
+        api = FakeAsyncTRApi(derivative_results=raw, tickers={})   # no quote
+        client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
+        with caplog.at_level("WARNING", logger="lmtrade.tr"):
+            assert client.find_knockout("AAPL", "buy", 100.0, 5.0) is None
+        msg = " ".join(r.getMessage() for r in caplog.records)
+        assert "no knockout qualified" in msg
+        assert "no ask quote: 1" in msg
+        assert "someOtherField" in msg          # raw field names surfaced
+
+    def test_no_warning_when_a_candidate_qualifies(self, caplog):
+        raw = [{"isin": "DE000X1", "optionType": "long", "strike": 80.0, "barrier": 80.0,
+                "size": 0.1, "leverage": 5.0}]
+        api = FakeAsyncTRApi(derivative_results=raw,
+                             tickers={"DE000X1": {"ask": {"price": "2.10"}}})
+        client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
+        with caplog.at_level("WARNING", logger="lmtrade.tr"):
+            assert client.find_knockout("AAPL", "buy", 100.0, 5.0) is not None
+        assert "no knockout qualified" not in " ".join(r.getMessage() for r in caplog.records)
+
+
+class TestKnockoutSelectionWithQuotes:
+    """find_knockout: right direction only (from optionType), leverage closest
+    to target, and a REAL ask from TR's ticker — the search has no prices."""
+
+    def client(self, results, tickers):
+        api = FakeAsyncTRApi(derivative_results=results, tickers=tickers)
+        return PytrDerivatives("+491234", "1234", api_factory=lambda: api), api
+
+    def ko(self, isin, opt, lev):
+        return {"isin": isin, "optionType": opt, "strike": 80.0, "barrier": 80.0,
+                "size": 0.1, "leverage": lev, "currency": "USD"}
+
+    def test_picks_closest_leverage_of_right_kind_with_real_ask(self):
+        c, api = self.client([self.ko("S1", "short", 5.0), self.ko("L1", "long", 9.0),
+                              self.ko("L2", "long", 5.5)],
+                             {"L2": {"ask": {"price": "1.91"}, "bid": {"price": "1.89"}}})
+        q = c.find_knockout("AAPL", "buy", 100.0, 5.0)
+        assert q.isin == "L2" and q.kind == "ko_call"
+        assert q.price == pytest.approx(1.91)
+        assert not any(call[0] == "ticker" and call[1] == "S1" for call in api.calls)
+
+    def test_sell_never_gets_a_long(self):
+        c, _ = self.client([self.ko("L1", "long", 5.0)], {"L1": {"ask": {"price": "2"}}})
+        assert c.find_knockout("AAPL", "sell", 100.0, 5.0) is None
+
+    def test_falls_through_to_next_candidate_without_quote(self):
+        c, _ = self.client([self.ko("L1", "long", 5.0), self.ko("L2", "long", 6.0)],
+                           {"L2": {"ask": {"price": 2.2}}})
+        q = c.find_knockout("AAPL", "buy", 100.0, 5.0)
+        assert q.isin == "L2" and q.price == pytest.approx(2.2)
+
+    @pytest.mark.parametrize("payload", [{}, {"ask": {}}, {"ask": {"price": "x"}},
+                                         {"ask": {"price": 0}}, "garbage"])
+    def test_unusable_quote_is_no_quote(self, payload):
+        c, _ = self.client([self.ko("L1", "long", 5.0)], {"L1": payload})
+        assert c.find_knockout("AAPL", "buy", 100.0, 5.0) is None
+
+
+class TestNoHangOnSilentTR:
+    """Live incident: a ticker subscription TR never answered blocked the whole
+    engine (no decisions, no exit checks) indefinitely. Every TR response
+    wait is bounded; an unanswered quote is simply 'no quote'."""
+
+    class SilentTickerApi(FakeAsyncTRApi):
+        async def recv(self):
+            if self.calls and self.calls[-1][0] == "ticker":
+                import asyncio
+                await asyncio.sleep(3600)             # TR never answers
+            return await super().recv()
+
+    def test_quote_ask_times_out_to_none(self):
+        import time as _t
+        api = self.SilentTickerApi()
+        client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
+        client.QUOTE_TIMEOUT_S = 0.2
+        t0 = _t.monotonic()
+        assert client.quote_ask("DE000X1") is None
+        assert _t.monotonic() - t0 < 5
+        assert ("unsubscribe", "sub-ticker") in api.calls
+
+    def test_find_knockout_survives_silent_quotes(self):
+        raw = [{"isin": "DE000X1", "optionType": "long", "strike": 80.0, "barrier": 80.0,
+                "size": 0.1, "leverage": 5.0}]
+        api = self.SilentTickerApi(derivative_results=raw)
+        client = PytrDerivatives("+491234", "1234", api_factory=lambda: api)
+        client.QUOTE_TIMEOUT_S = 0.2
+        assert client.find_knockout("AAPL", "buy", 100.0, 5.0) is None
+
+    def test_recv_for_has_an_overall_deadline(self):
+        import asyncio
+        from lmtrade.brokers.tr_derivatives import _recv_for
+
+        class Silent:
+            async def recv(self):
+                await asyncio.sleep(3600)
+
+        loop = asyncio.new_event_loop()        # private loop: don't unset the global one
+        try:
+            with pytest.raises(Exception):
+                loop.run_until_complete(_recv_for(Silent(), "s1", timeout=0.1))
+        finally:
+            loop.close()
+
+
+class TestCertificateExchange:
+    """Knockouts trade on the issuer's venue, not LS Exchange: TR never answered
+    ticker requests on LSX for them. The venue comes from instrument_details
+    and is used for both the quote and the order."""
+
+    def client(self, details=None, tickers=None, results=None):
+        api = FakeAsyncTRApi(details=details, tickers=tickers, derivative_results=results)
+        return PytrDerivatives("+491234", "1234", api_factory=lambda: api), api
+
+    def test_exchange_from_exchange_ids(self):
+        c, _ = self.client(details={"DE1": {"exchangeIds": ["BHS"]}})
+        assert c.exchange_for("DE1") == "BHS"
+
+    def test_exchange_from_exchange_objects(self):
+        c, _ = self.client(details={"DE1": {"exchanges": [{"slug": "VON"}, {"slug": "TDG"}]}})
+        assert c.exchange_for("DE1") == "VON"
+
+    def test_prefers_lsx_when_listed(self):
+        c, _ = self.client(details={"DE1": {"exchangeIds": ["TDG", "LSX"]}})
+        assert c.exchange_for("DE1") == "LSX"
+
+    def test_unknown_shape_is_none(self):
+        c, _ = self.client(details={"DE1": {"something": 1}})
+        assert c.exchange_for("DE1") is None
+
+    def test_cached(self):
+        c, api = self.client(details={"DE1": {"exchangeIds": ["BHS"]}})
+        c.exchange_for("DE1"); c.exchange_for("DE1")
+        assert [x for x in api.calls if x[0] == "instrument_details"] == [("instrument_details", "DE1")]
+
+    def test_quote_uses_resolved_exchange(self):
+        c, api = self.client(details={"DE1": {"exchangeIds": ["BHS"]}},
+                             tickers={"DE1": {"ask": {"price": "1.5"}}})
+        assert c.quote_ask("DE1") == pytest.approx(1.5)
+        assert ("ticker", "DE1", "BHS") in api.calls
+
+    def test_find_knockout_carries_exchange(self):
+        raw = [{"isin": "DE1", "optionType": "long", "strike": 80.0, "barrier": 80.0,
+                "size": 0.1, "leverage": 5.0}]
+        c, _ = self.client(details={"DE1": {"exchangeIds": ["BHS"]}},
+                           tickers={"DE1": {"ask": {"price": "1.5"}}}, results=raw)
+        q = c.find_knockout("AAPL", "buy", 100.0, 5.0)
+        assert q.exchange == "BHS" and q.price == pytest.approx(1.5)

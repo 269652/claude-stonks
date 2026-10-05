@@ -278,7 +278,7 @@ class TestWatchConfigAndSorting:
         assert {"entry.watch_enabled", "entry.watch_k", "entry.watch_max_hours",
                 "entry.watch_window"} <= keys
 
-    def test_api_sorted_by_distance_ascending_unknown_last(self, settings, store):
+    def test_api_sorted_by_priority(self, settings, store):
         from fastapi.testclient import TestClient
 
         from lmtrade.web.app import create_app
@@ -290,4 +290,7 @@ class TestWatchConfigAndSorting:
             "MID": {"direction": "sell", "confidence": 0.6, "added_ts": now, "z": 0.5},
         })
         rows = TestClient(create_app(settings)).get("/api/watchlist").json()
-        assert [r["symbol"] for r in rows] == ["NEAR", "MID", "FAR", "UNK"]
+        # priority = (2*conf + 1/(1+to_go)) / 3 with k = 1 — confidence weighs double:
+        # FAR .683 (to_go 3), UNK .660 (unknown), MID .622 (to_go .5), NEAR .611 (to_go .2)
+        assert [r["symbol"] for r in rows] == ["FAR", "UNK", "MID", "NEAR"]
+        assert rows[0]["priority"] == pytest.approx((1.8 + 1 / 4) / 3, abs=1e-4)

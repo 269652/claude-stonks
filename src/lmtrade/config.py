@@ -147,6 +147,13 @@ class EntryConfig(BaseModel):
     # the target drifts more than reprice_drift (fraction).
     limit_orders: bool = False
     reprice_drift: float = 0.005
+    # Signals at or above this confidence skip the timing and are entered at
+    # the current price (limit mode: a marketable limit + instant_slippage).
+    instant_confidence: float = 1.0
+    instant_slippage: float = 0.005
+    # Volatile symbols (intraday sigma >= this % of price) get no resting limit
+    # order — they are entered with a market order once triggered. 0 = off.
+    market_above_sigma_pct: float = 0.0
 
 
 class OptionsConfig(BaseModel):

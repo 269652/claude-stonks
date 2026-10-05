@@ -113,3 +113,47 @@ class TestLiveRealized:
 
     def test_paper_view_realized_unchanged(self, settings, closed):
         assert self.realized(settings, "paper")["total_pnl"] == pytest.approx(10.0)
+
+
+class TestResearchFallbackInLive:
+    """News, analysis and signals are market research, not money: right after
+    arming live, the fresh live book has none yet, so the dashboard shows the
+    paper book's research until the live book has its own."""
+
+    @pytest.fixture()
+    def research(self, settings):
+        paper = Store(settings.db_path)
+        paper.add_news("AAPL", "Apple up on earnings", "bullish")
+        paper.set_meta("market_analysis", {"ts": 1.0, "symbols": {"AAPL": {"bias": "buy"}}})
+        paper.add_activity("decision", "AAPL: BUY conf 0.80", "AAPL",
+                           {"direction": "buy", "confidence": 0.8, "signals": []})
+        paper.close()
+
+    def client(self, settings, armed=True):
+        c = ControlState(settings.control_path)
+        c.set_mode("live")
+        c.armed = armed
+        c._save()
+        return TestClient(create_app(settings))
+
+    def test_empty_live_book_falls_back_to_paper_research(self, settings, research):
+        c = self.client(settings)
+        assert [n["symbol"] for n in c.get("/api/news").json()] == ["AAPL"]
+        assert "AAPL" in c.get("/api/analysis").json()["symbols"]
+        assert [s["symbol"] for s in c.get("/api/signals?min_confidence=0.5").json()] == ["AAPL"]
+
+    def test_live_book_research_wins_once_present(self, settings, research):
+        live = Store(settings.live_db_path)
+        live.add_news("MSFT", "Microsoft live news", "neutral")
+        live.set_meta("market_analysis", {"ts": 2.0, "symbols": {"MSFT": {"bias": "sell"}}})
+        live.add_activity("decision", "MSFT: SELL conf 0.70", "MSFT",
+                          {"direction": "sell", "confidence": 0.7, "signals": []})
+        live.close()
+        c = self.client(settings)
+        assert [n["symbol"] for n in c.get("/api/news").json()] == ["MSFT"]
+        assert list(c.get("/api/analysis").json()["symbols"]) == ["MSFT"]
+        assert [s["symbol"] for s in c.get("/api/signals?min_confidence=0.5").json()] == ["MSFT"]
+
+    def test_money_endpoints_never_fall_back(self, settings, research):
+        s = self.client(settings).get("/api/summary").json()
+        assert s["positions"] == []

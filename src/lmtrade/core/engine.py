@@ -25,6 +25,8 @@ from ..config import Settings
 from ..data.market import MarketData, Quote
 from ..economics.cost_accounting import CostAccountant
 from ..finance.knockouts import (
+    MAX_LEVERAGE,
+    MIN_LEVERAGE,
     is_knocked_out,
     knockout_price,
     strike_after_financing,
@@ -43,9 +45,9 @@ from ..strategies.optimizer import StrategyOptimizer
 from .control import LOW_BALANCE_EUR
 from .events import EventBus
 from .scheduler import Scheduler
-from .state import Store, Trade
+from .state import Position, Store, Trade
 from .exits import exit_plan
-from .limit_orders import needs_reprice, target_spot
+from .limit_orders import entry_priority, needs_reprice, relative_sigma_pct, target_spot
 from .watchlist import entry_z, should_enter
 
 OPTION_FEE = 1.0   # per option/knockout order: TR's flat 1 EUR fee, charged on
@@ -97,6 +99,9 @@ class Engine:
         self._close_wait_logged: set[tuple[str, str]] = set()   # manual-close retry notices
         self._exit_retry_at: dict[int, float] = {}   # option id -> next live-exit attempt
         self._last_exit_check = 0.0     # wall clock of the last fast exit check
+        self._last_portfolio_check = 0.0  # wall clock of the last live fill reconciliation
+        self._last_cash: float | None = None   # last successfully read cash
+        self._last_equity_point = 0.0           # wall clock of the last equity point
         self._fast_exit_checks = 0
         store.set_meta("mode", broker.mode)
         store.set_meta("universe", settings.universe)
@@ -126,6 +131,13 @@ class Engine:
         if (o.get("instrument_type") or "option") == "knockout":
             if is_knocked_out(spot, o["barrier"], o["kind"]):
                 return 0.0
+            ref = (self.store.get_meta("ko_refs") or {}).get(str(o.get("id")))
+            if ref:
+                price = self._anchored_price(ref["price"], ref["spot"], ref["size"],
+                                             ref["currency"], o["kind"], spot,
+                                             fallback_fx=ref.get("fx"))
+                if price is not None:
+                    return price
             days_held = max(0.0, (self.now() - o["opened_ts"]) / 86400.0)
             eff_strike = strike_after_financing(o["strike"], o["kind"], days_held)
             return knockout_price(spot, eff_strike, o["ratio"] or 1.0, o["kind"])
@@ -404,7 +416,9 @@ class Engine:
                 if not manual and self._exit_retry_at.get(o["id"], 0.0) > now:
                     return False
                 size = float(int(o["contracts"]))   # whole certificates
-                res = self.broker.place_order(isin, "sell", size)
+                ref = (self.store.get_meta("ko_refs") or {}).get(str(o["id"])) or {}
+                res = self.broker.place_order(isin, "sell", size,
+                                              exchange=ref.get("exchange") or "LSX")
                 if not res.ok:
                     self._exit_retry_at[o["id"]] = now + LIVE_EXIT_RETRY_S
                     self.bus.warn(
@@ -427,7 +441,7 @@ class Engine:
         self.broker.adjust_cash(max(0.0, proceeds))
         self.store.record_cost("fee", OPTION_FEE, "options")
         self.store.close_option(o["id"], mark, pnl)
-        for key in ("trail_peaks", "exit_overrides"):
+        for key in ("trail_peaks", "exit_overrides", "ko_refs"):
             state = self.store.get_meta(key) or {}
             if state.pop(str(o["id"]), None) is not None:
                 self.store.set_meta(key, state)
@@ -547,6 +561,26 @@ class Engine:
         if tradeable:
             self._manage_options(prices, tradeable)
             self._persist_option_marks(prices)
+            self._record_equity_point(prices)
+
+    EQUITY_POINT_S = 30.0   # extra equity-curve points while positions are open
+
+    def _record_equity_point(self, prices: dict[str, float]) -> None:
+        """Equity point between cycles (from the fast exit check) so the curve
+        tracks open positions every ~30s instead of once per cycle. Live uses
+        the last successfully read cash (no extra TR request)."""
+        if time.time() - self._last_equity_point < self.EQUITY_POINT_S:
+            return
+        if hasattr(self.broker, "last_cash_ok"):
+            if self._last_cash is None:
+                return
+            cash = self._last_cash
+        else:
+            cash = self.broker.cash()
+        all_prices = {**self._last_good_price, **prices}
+        equity = cash + self._positions_value(all_prices) + self._options_value(all_prices)
+        self.store.record_equity(cash, equity, self.store.total_costs().get("fee", 0.0))
+        self._last_equity_point = time.time()
 
     def _poll_close_requests(self) -> None:
         if self.store.get_meta("close_requests"):
@@ -727,6 +761,9 @@ class Engine:
             side = "below" if decision.direction == "buy" else "above"
             entry = wl.get(sym)
             if entry is None or entry["direction"] != decision.direction:
+                if not self._tr_tradable(sym, decision.direction):
+                    wl.pop(sym, None)
+                    continue
                 wl[sym] = {"direction": decision.direction,
                            "confidence": round(decision.confidence, 3),
                            "added_ts": now, "genome_id": genome_id}
@@ -739,18 +776,97 @@ class Engine:
             # For the dashboard's Watchlist tab: where price is right now.
             wl[sym]["z"] = None if z is None else round(z, 4)
             wl[sym]["checked_ts"] = now
-            if should_enter(decision.direction, z, cfg.watch_k):
+            # High-confidence signals skip the timing entirely.
+            instant = decision.confidence >= cfg.instant_confidence
+            wl[sym]["instant"] = instant
+            # Prices for the dashboard: underlying now and the entry target.
+            tgt = (quote.price if instant else
+                   target_spot(quote.history, cfg.watch_window, cfg.watch_k,
+                               decision.direction))
+            wl[sym]["spot"] = round(quote.price, 4)
+            wl[sym]["target"] = None if tgt is None else round(tgt, 4)
+            sigma_pct = relative_sigma_pct(quote.history, cfg.watch_window)
+            wl[sym]["sigma_pct"] = None if sigma_pct is None else round(sigma_pct, 4)
+            wl[sym]["high_vol"] = bool(cfg.market_above_sigma_pct > 0 and sigma_pct is not None
+                                       and sigma_pct >= cfg.market_above_sigma_pct)
+            if instant or should_enter(decision.direction, z, cfg.watch_k):
+                why = (f"confidence {decision.confidence:.2f} >= {cfg.instant_confidence:g} "
+                       f"(instant)" if instant else f"at {z_txt}")
                 self.bus.info(f"[watch] {sym}: {decision.direction.upper()} triggered "
-                              f"at {z_txt}", source="engine")
+                              f"{why}", source="engine")
                 triggered.append((decision, genome_id))
 
         self.store.set_meta("watchlist", wl)
         self.store.set_meta("watchlist_expired", expired)
         return triggered
 
+    def _tr_tradable(self, symbol: str, direction: str) -> bool:
+        """Whether TR offers a knockout for this signal (right direction,
+        leverage within the band). Cached 6h. Without a TR client (plain
+        paper) everything may be watched."""
+        tr = self.tr_derivatives
+        if tr is None or not tr.available():
+            return True
+        kind = "ko_call" if direction == "buy" else "ko_put"
+        cache = self.__dict__.setdefault("_tradable_cache", {})
+        hit = cache.get((symbol, kind))
+        if hit and time.time() - hit[1] < 6 * 3600:
+            return hit[0]
+        try:
+            results = tr.search(symbol, direction)
+        except Exception:  # noqa: BLE001 — unknown: don't cache, don't watch
+            return False
+        ok = any(q.kind == kind and MIN_LEVERAGE <= q.leverage <= MAX_LEVERAGE
+                 for q in results)
+        cache[(symbol, kind)] = (ok, time.time())
+        if not ok:
+            side = "long" if kind == "ko_call" else "short"
+            self.bus.info(f"[watch] {symbol}: not tradable on TR (no {side} knockout with "
+                          f"leverage {MIN_LEVERAGE:g}-{MAX_LEVERAGE:g}) — not watched",
+                          source="engine")
+        return ok
+
     # ------------------------------------------------- exchange-side entries
-    def _instrument_price(self, inst: dict, spot: float) -> float:
-        """Model price of an instrument (option / knockout) at `spot`."""
+    def _fx_rate(self, currency: str | None) -> float | None:
+        """Units of `currency` per EUR (e.g. EURUSD), cached 10 minutes. None
+        when no trustworthy quote — never guess an exchange rate."""
+        cur = (currency or "EUR").upper()
+        if cur == "EUR":
+            return 1.0
+        cache = self.__dict__.setdefault("_fx_cache", {})
+        hit = cache.get(cur)
+        if hit and time.time() - hit[1] < 600:
+            return hit[0]
+        try:
+            q = self.market.quote(f"EUR{cur}=X")
+        except Exception:  # noqa: BLE001
+            return None
+        if not self._is_trustworthy(q) or not q.price or q.price <= 0:
+            return None
+        cache[cur] = (float(q.price), time.time())
+        return float(q.price)
+
+    def _anchored_price(self, ref_price: float, ref_spot: float, size: float,
+                        currency: str | None, kind: str, spot: float,
+                        fallback_fx: float | None = None) -> float | None:
+        """Knockout price from a real reference quote: it moves 1:1 with the
+        underlying per `size` (underlying per certificate), converted from
+        the underlying's currency to EUR."""
+        fx = self._fx_rate(currency) or fallback_fx
+        if not fx:
+            return None
+        delta = 1.0 if kind == "ko_call" else -1.0
+        return max(0.0, ref_price + delta * (spot - ref_spot) * size / fx)
+
+    def _instrument_price(self, inst: dict, spot: float) -> float | None:
+        """Price of an instrument (option / knockout) at `spot`: anchored to
+        TR's real quote for knockouts that carry one, the model otherwise.
+        None when an anchored price can't be computed (no FX rate)."""
+        if inst.get("ref_price"):
+            if inst.get("barrier") and is_knocked_out(spot, inst["barrier"], inst["kind"]):
+                return 0.0
+            return self._anchored_price(inst["ref_price"], inst["ref_spot"], inst["size"],
+                                        inst.get("currency"), inst["kind"], spot)
         pseudo = {**inst, "opened_ts": self.now(), "entry_premium": 0.0, "contracts": 0.0}
         return self._mark_position(pseudo, spot)
 
@@ -762,9 +878,19 @@ class Engine:
             ko = tr.find_knockout(quote.symbol, direction, quote.price,
                                   self.settings.tr.target_leverage)
             if ko is not None and ko.price > 0:
+                currency = getattr(ko, "currency", "EUR") or "EUR"
+                if self._fx_rate(currency) is None:
+                    self.bus.warn(f"[limit] {quote.symbol}: no EUR{currency} rate — can't "
+                                  f"price {ko.isin} in EUR, skipping", source="engine")
+                    return None
                 return {"instrument_type": "knockout", "kind": ko.kind, "strike": ko.strike,
                         "barrier": ko.barrier, "ratio": ko.ratio, "isin": ko.isin,
-                        "expiry_ts": self.now() + 365 * 86400.0, "iv": 0.0}
+                        "expiry_ts": self.now() + 365 * 86400.0, "iv": 0.0,
+                        # real TR ask at the current underlying price: limits and
+                        # marks are anchored to it (see _anchored_price)
+                        "ref_price": ko.price, "ref_spot": quote.price,
+                        "size": 1.0 / ko.ratio if ko.ratio else 1.0, "currency": currency,
+                        "exchange": getattr(ko, "exchange", None)}
         if armed:
             return None
         kind = "call" if direction == "buy" else "put"
@@ -777,7 +903,9 @@ class Engine:
     def _place_limit_entry(self, sym: str, w: dict, quote: Quote, armed: bool) -> dict | None:
         cfg = self.settings.entry
         direction = w["direction"]
-        tgt = target_spot(quote.history, cfg.watch_window, cfg.watch_k, direction)
+        instant = bool(w.get("instant"))
+        tgt = (quote.price if instant
+               else target_spot(quote.history, cfg.watch_window, cfg.watch_k, direction))
         if tgt is None:
             return None
         inst = self._select_instrument(quote, direction, armed)
@@ -786,8 +914,10 @@ class Engine:
                           source="engine")
             return None
         limit = self._instrument_price(inst, tgt)
-        if limit <= 0:
+        if limit is None or limit <= 0:
             return None
+        if instant:
+            limit *= 1 + cfg.instant_slippage      # marketable: fills right away
         decision = Decision(sym, direction, float(w.get("confidence") or 0.0),
                             "watch-list limit entry")
         budget = self._position_budget(quote, decision, w.get("genome_id"))
@@ -809,12 +939,17 @@ class Engine:
                               f"€{LOW_BALANCE_EUR:.0f} and the low-balance guard is not armed.",
                               source="engine")
                 return None
-            res = self.broker.place_limit_order(inst["isin"], "buy", size, limit)
+            res = self.broker.place_limit_order(inst["isin"], "buy", size, limit,
+                                                exchange=inst.get("exchange") or "LSX")
             if not res.ok:
                 self.bus.warn(f"LIVE limit order rejected [{inst['isin']}]: {res.message}",
                               source="engine")
                 return None
             order_id, limit = res.order_id, (res.price or limit)
+            self._remember_order(inst["isin"], {
+                "underlying": sym, "direction": direction, "instrument": inst,
+                "target_spot": tgt, "confidence": w.get("confidence"),
+                "genome_id": w.get("genome_id"), "order_id": order_id})
         side = "below" if direction == "buy" else "above"
         self.bus.info(
             f"[limit] {sym}: {direction.upper()} {inst['kind']} resting limit "
@@ -823,10 +958,98 @@ class Engine:
         return {"direction": direction, "confidence": w.get("confidence"),
                 "genome_id": w.get("genome_id"), "instrument": inst, "limit": limit,
                 "size": size, "notional": size * limit, "target_spot": tgt,
-                "placed_ts": self.now(), "order_id": order_id}
+                "placed_ts": self.now(), "order_id": order_id, "instant": instant,
+                "last_price": self._instrument_price(inst, quote.price)}
 
-    def _book_limit_fill(self, sym: str, p: dict, price: float) -> None:
+    PORTFOLIO_CHECK_S = 60.0   # live: re-read the TR portfolio at most this often
+
+    def _remember_order(self, isin: str, rec: dict) -> None:
+        """Keep a placed live order's details for 7 days, so a fill can be
+        recognised in the TR portfolio even if order tracking missed it."""
+        hist = self.store.get_meta("order_history") or {}
+        cutoff = time.time() - 7 * 86400
+        hist = {k: v for k, v in hist.items() if float(v.get("placed_ts", 0)) >= cutoff}
+        hist[isin] = {**rec, "placed_ts": time.time()}
+        self.store.set_meta("order_history", hist)
+
+    def _resolve_instrument(self, underlying: str, direction: str, isin: str) -> dict | None:
+        tr = self.tr_derivatives
+        if tr is None:
+            return None
+        try:
+            match = next((q for q in tr.search(underlying, direction) if q.isin == isin), None)
+        except Exception:  # noqa: BLE001
+            return None
+        if match is None:
+            return None
+        exchange = match.exchange or (tr.exchange_for(isin) if hasattr(tr, "exchange_for")
+                                      else None)
+        return {"instrument_type": "knockout", "kind": match.kind, "strike": match.strike,
+                "barrier": match.barrier, "ratio": match.ratio, "isin": isin,
+                "expiry_ts": self.now() + 365 * 86400.0, "iv": 0.0,
+                "size": 1.0 / match.ratio if match.ratio else 1.0,
+                "currency": match.currency or "EUR", "exchange": exchange}
+
+    def _reconcile_live_holdings(self, force: bool = False) -> None:
+        """Book any remembered certificate that sits in the real TR portfolio
+        but isn't a managed position yet: a fill the order tracking missed, a
+        fill racing a cancel, or a row the startup sync imported as a bare
+        equity position (no price / P&L / exits)."""
+        if not self._live_armed():
+            return
+        tr = self.tr_derivatives
+        if tr is None or not hasattr(tr, "portfolio"):
+            return
+        now = time.time()
+        if not force and now - self._last_portfolio_check < self.PORTFOLIO_CHECK_S:
+            return
+        self._last_portfolio_check = now
+        try:
+            holdings = tr.portfolio()
+        except Exception:  # noqa: BLE001
+            return
+        if holdings is None:
+            return                                # unknown: never act on missing data
+        hist = self.store.get_meta("order_history") or {}
+        held = {o.get("isin") for o in self.store.open_options()}
+        pend = self.store.get_meta("pending_entries") or {}
+        for item in holdings:
+            isin = item.get("isin")
+            rec = hist.get(isin)
+            if not rec or isin in held:
+                continue
+            size, price = float(item.get("size") or 0), float(item.get("avg_price") or 0)
+            if size <= 0 or price <= 0:
+                continue
+            sym = rec["underlying"]
+            inst = rec.get("instrument") or self._resolve_instrument(sym, rec["direction"], isin)
+            if inst is None:
+                self.bus.warn(f"[limit] {sym}: {isin} is in the TR portfolio but its "
+                              f"details can't be resolved — not adopted", source="engine")
+                continue
+            spot = rec.get("target_spot") or self._last_good_price.get(sym)
+            inst = {**inst, "ref_price": price, "ref_spot": spot}
+            if self.store.position(isin) is not None:
+                self.store.upsert_position(Position(isin, 0.0, 0.0, 0.0))  # drop bare row
+            self._book_limit_fill(sym, {"direction": rec["direction"],
+                                        "confidence": rec.get("confidence"),
+                                        "genome_id": rec.get("genome_id"), "instrument": inst,
+                                        "size": size, "limit": price, "target_spot": spot},
+                                  price, spot=spot)
+            held.add(isin)
+            if (pend.get(sym) or {}).get("instrument", {}).get("isin") == isin:
+                pend.pop(sym)
+            self.bus.info(f"[limit] {sym}: fill found in TR portfolio — booked {isin} "
+                          f"×{size:g} @ {price:.3f}", source="engine")
+        self.store.set_meta("pending_entries", pend)
+
+    def _book_limit_fill(self, sym: str, p: dict, price: float,
+                         spot: float | None = None) -> None:
+        """Book a filled limit entry. `spot` = underlying price at the fill
+        (live fills: the order's target, where a limit at that price fills)."""
         inst, contracts = p["instrument"], float(p["size"])
+        if spot is None:
+            spot = p.get("target_spot") or self._last_good_price.get(sym)
         if not self._live_armed():
             if not self.broker.adjust_cash(-(contracts * price + OPTION_FEE)):
                 self.bus.warn(f"[limit] {sym}: fill needs more cash than available — "
@@ -834,13 +1057,20 @@ class Engine:
                 return
         self.store.record_cost("fee", OPTION_FEE, "options")
         cfg = self.settings.options
-        self.store.open_option(
+        oid = self.store.open_option(
             sym, inst["kind"], inst["strike"], inst["expiry_ts"], inst.get("iv") or 0.0,
             contracts, price, p.get("genome_id"),
             tp_premium=price * (1 + cfg.take_profit_pct),
             sl_premium=price * (1 - cfg.stop_loss_pct),
             instrument_type=inst["instrument_type"], barrier=inst.get("barrier"),
             ratio=inst.get("ratio"), isin=inst.get("isin"))
+        if inst.get("ref_price") and spot:
+            refs = self.store.get_meta("ko_refs") or {}
+            refs[str(oid)] = {"price": price, "spot": spot, "size": inst["size"],
+                              "currency": inst.get("currency"),
+                              "exchange": inst.get("exchange"),
+                              "fx": self._fx_rate(inst.get("currency"))}
+            self.store.set_meta("ko_refs", refs)
         self.store.record_trade(Trade(
             sym, "buy", contracts, price, OPTION_FEE, self.broker.mode,
             f"limit fill {inst['kind']} {inst.get('isin') or 'synthetic'} — watch-list entry",
@@ -853,6 +1083,10 @@ class Engine:
         (live cancel failed and TR doesn't confirm it's gone)."""
         oid = p.get("order_id")
         if self._live_armed() and oid:
+            self._reconcile_live_holdings(force=True)
+            isin = p["instrument"].get("isin")
+            if isin and any(o.get("isin") == isin for o in self.store.open_options()):
+                return True                       # it had filled: booked, nothing to cancel
             if not self.broker.cancel_order(oid):
                 st = self.broker.order_status(oid)
                 if st and st["state"] == "filled":
@@ -872,6 +1106,8 @@ class Engine:
         watched signals closest to their entry while capital and slots last."""
         cfg = self.settings.entry
         armed = self._live_armed()
+        if armed:
+            self._reconcile_live_holdings()   # fills seen in the real TR portfolio
         wl: dict = self.store.get_meta("watchlist") or {}
         pend: dict = self.store.get_meta("pending_entries") or {}
 
@@ -881,13 +1117,24 @@ class Engine:
                 if self._drop_pending(sym, p, "signal gone or watch expired"):
                     pend.pop(sym)
                 continue
+            if w.get("high_vol"):
+                if self._drop_pending(sym, p, f"volatility {w.get('sigma_pct')}% above "
+                                              f"{cfg.market_above_sigma_pct:g}% — market "
+                                              f"entry on trigger instead"):
+                    pend.pop(sym)
+                continue
             quote = quotes.get(sym)
+            if quote is not None and sym in tradeable:
+                lp = self._instrument_price(p["instrument"], quote.price)
+                if lp is not None:
+                    p["last_price"] = round(lp, 4)      # certificate price now (dashboard)
             if armed:
                 st = self.broker.order_status(p["order_id"]) if p.get("order_id") else None
                 if st is None:
                     continue                      # unknown: never assume a fill
                 if st["state"] == "filled":
-                    self._book_limit_fill(sym, p, st.get("fill_price") or p["limit"])
+                    self._book_limit_fill(sym, p, st.get("fill_price") or p["limit"],
+                                          spot=p.get("target_spot"))
                     pend.pop(sym)
                     continue
                 if st["state"] == "gone":
@@ -895,25 +1142,31 @@ class Engine:
                     continue
             elif quote is not None and sym in tradeable:
                 now_price = self._instrument_price(p["instrument"], quote.price)
-                if 0 < now_price <= p["limit"]:   # buy limit: fills at or below
-                    self._book_limit_fill(sym, p, now_price)
+                if now_price is not None and 0 < now_price <= p["limit"]:   # fills at/below
+                    self._book_limit_fill(sym, p, now_price, spot=quote.price)
                     pend.pop(sym)
                     continue
             if quote is None or sym not in tradeable:
                 continue
-            tgt = target_spot(quote.history, cfg.watch_window, cfg.watch_k, p["direction"])
+            tgt = (quote.price if p.get("instant")
+                   else target_spot(quote.history, cfg.watch_window, cfg.watch_k,
+                                    p["direction"]))
             if tgt is None:
                 continue
             new_limit = self._instrument_price(p["instrument"], tgt)
-            if new_limit <= 0 or not needs_reprice(p["limit"], new_limit, cfg.reprice_drift):
+            if new_limit is not None and p.get("instant"):
+                new_limit *= 1 + cfg.instant_slippage
+            if (new_limit is None or new_limit <= 0
+                    or not needs_reprice(p["limit"], new_limit, cfg.reprice_drift)):
                 continue
             if armed:
                 if not self._drop_pending(sym, p, "re-pricing"):
                     continue
                 if not self.store.open_options() or all(
                         o["underlying"] != sym for o in self.store.open_options()):
-                    res = self.broker.place_limit_order(p["instrument"]["isin"], "buy",
-                                                        p["size"], new_limit)
+                    res = self.broker.place_limit_order(
+                        p["instrument"]["isin"], "buy", p["size"], new_limit,
+                        exchange=p["instrument"].get("exchange") or "LSX")
                     if not res.ok:
                         self.bus.warn(f"[limit] {sym}: re-placing failed — {res.message}",
                                       source="engine")
@@ -934,14 +1187,21 @@ class Engine:
         k = cfg.watch_k
 
         def to_go(w: dict) -> float:
+            if w.get("instant"):
+                return 0.0
             z = w.get("z")
             if z is None:
                 return float("inf")
             return max(0.0, z + k) if w["direction"] == "buy" else max(0.0, k - z)
 
+        def priority(w: dict) -> float:
+            d = to_go(w)
+            return entry_priority(w.get("confidence"), None if d == float("inf") else d)
+
         waiting = sorted(((s, w) for s, w in wl.items()
-                          if s not in pend and s not in held and s in tradeable and s in quotes),
-                         key=lambda sw: to_go(sw[1]))
+                          if s not in pend and s not in held and s in tradeable and s in quotes
+                          and not w.get("high_vol")),
+                         key=lambda sw: -priority(sw[1]))
         for sym, w in waiting:
             if free <= 0:
                 break
@@ -1047,7 +1307,8 @@ class Engine:
                     f"LIVE knockout {ko.isin}: budget too small for one "
                     f"certificate at {ko.price:.2f} — skipping.", source="engine")
                 return True
-            res = self.broker.place_order(ko.isin, "buy", float(size))
+            res = self.broker.place_order(ko.isin, "buy", float(size),
+                                          exchange=getattr(ko, "exchange", None) or "LSX")
             if not res.ok:
                 self.bus.warn(f"LIVE knockout order rejected [{ko.isin}]: "
                               f"{res.message}", source="engine")
@@ -1291,9 +1552,13 @@ class Engine:
                 candidates = self._watchlist_triggers(candidates, evaluated, quotes)
                 if self.settings.entry.limit_orders:
                     # Exchange-side entries: resting limit orders instead of
-                    # market orders on trigger (TP / SL exits stay market).
+                    # market orders on trigger (TP / SL exits stay market) —
+                    # except volatile symbols, entered at market once triggered.
+                    wl_now = self.store.get_meta("watchlist") or {}
+                    market_now = [(d, g) for d, g in candidates
+                                  if (wl_now.get(d.symbol) or {}).get("high_vol")]
                     self._manage_limit_entries(quotes, tradeable, econ)
-                    candidates = []
+                    candidates = market_now
 
             # Rank by confidence so limited slots go to the strongest signals
             # across the whole universe, not just whichever symbols happened
@@ -1339,7 +1604,12 @@ class Engine:
         cash = self.broker.cash()
         equity = cash + self._positions_value(prices) + self._options_value(prices)
         fees = self.store.total_costs().get("fee", 0.0)
-        self.store.record_equity(cash, equity, fees)
+        # A failed live cash read reports 0 — never record that as the account
+        # value (it showed up as 0-EUR spikes that flattened the whole curve).
+        if getattr(self.broker, "last_cash_ok", True):
+            self.store.record_equity(cash, equity, fees)
+            self._last_cash = cash
+            self._last_equity_point = time.time()
 
     # -------------------------------------------------------------- long loop
     def stop(self) -> None:

@@ -111,6 +111,9 @@ entry:                     # watch-list entry timing (core/watchlist.py)
   watch_max_hours: 4.0     # drop the watch entry if no good entry comes within this time
   limit_orders: true       # rest a limit order at the trigger price (exchange-side entry)
   reprice_drift: 0.005     # re-price the resting order when its target moves > 0.5%
+  instant_confidence: 1.0  # signals at/above this skip the timing and enter right away
+  instant_slippage: 0.005  # marketable-limit headroom for those instant entries
+  market_above_sigma_pct: 1.0  # intraday sigma >= 1% of price: market order on trigger, no limit
 
 learning:                  # evolutionary strategy optimizer
   enabled: true

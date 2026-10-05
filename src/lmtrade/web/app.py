@@ -21,6 +21,7 @@ from ..config import DEFAULT_TOML_PATH, Settings, load_settings
 from ..core.control import LOW_BALANCE_EUR, ControlState
 from ..core.engine import OPTION_FEE
 from ..core.exits import exit_plan, pnl_for_premium, validate_override
+from ..core.limit_orders import entry_priority
 from ..core.state import Store
 from . import settings_editor
 
@@ -100,6 +101,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         live book (real TR account) even while unarmed — never the paper
         book the engine trades meanwhile."""
         return store_for("live") if control().mode == "live" else store()
+
+    def research_books() -> list[Store]:
+        """Where to read market research (news, analysis, signals): the active
+        book first, then the paper book. Research isn't money — right after
+        arming live the fresh live book has none yet, and showing nothing
+        until the engine rebuilds it hides perfectly current information."""
+        active = store()
+        return [active] if active is _books["paper"] else [active, _books["paper"]]
 
     if STATIC.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -260,7 +269,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/equity")
     def equity() -> JSONResponse:
-        return SafeJSONResponse(store().equity_curve(limit=500))
+        # LIVE view: the real account's curve (even while unarmed), without
+        # the 0-cash spikes old failed TR reads recorded.
+        if control().mode == "live":
+            curve = [p for p in view_book().equity_curve(limit=2000)
+                     if (p.get("cash") or 0) > 0]
+            return SafeJSONResponse(curve)
+        return SafeJSONResponse(store().equity_curve(limit=2000))
 
     @app.get("/api/costs")
     def costs() -> JSONResponse:
@@ -327,12 +342,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/news")
     def news() -> JSONResponse:
-        return SafeJSONResponse(store().recent_news(50))
+        for book in research_books():
+            rows = book.recent_news(50)
+            if rows:
+                return SafeJSONResponse(rows)
+        return SafeJSONResponse([])
 
     @app.get("/api/analysis")
     def analysis() -> JSONResponse:
         """The latest compiled daily market analysis (per-symbol bias)."""
-        return SafeJSONResponse(store().get_meta("market_analysis", {}) or {})
+        for book in research_books():
+            data = book.get_meta("market_analysis", {}) or {}
+            if data:
+                return SafeJSONResponse(data)
+        return SafeJSONResponse({})
 
     @app.get("/api/watchlist")
     def watchlist() -> JSONResponse:
@@ -347,25 +370,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             trigger = -cfg.watch_k if direction == "buy" else cfg.watch_k
             z = w.get("z")
             to_go = None
-            if z is not None:
+            if w.get("instant"):
+                to_go = 0.0              # high confidence: entered regardless of timing
+            elif z is not None:
                 to_go = max(0.0, z - trigger) if direction == "buy" else max(0.0, trigger - z)
             added = float(w.get("added_ts") or 0.0)
+            # % the underlying still has to move to reach the entry target.
+            spot, target = w.get("spot"), w.get("target")
+            distance = None
+            if w.get("instant"):
+                distance = 0.0
+            elif spot and target:
+                gap = (spot - target) if direction == "buy" else (target - spot)
+                distance = round(max(0.0, gap) / spot * 100, 4)
             rows.append({
-                "symbol": sym, "direction": direction,
+                "symbol": sym, "direction": direction, "instant": bool(w.get("instant")),
+                "spot": spot, "target": target, "distance_pct": distance,
+                "sigma_pct": w.get("sigma_pct"), "high_vol": bool(w.get("high_vol")),
                 "instrument": "call" if direction == "buy" else "put",
                 "confidence": w.get("confidence"), "z": z, "k": cfg.watch_k,
                 "trigger_z": trigger,
                 "sigma_to_go": None if to_go is None else round(to_go, 4),
+                "priority": round(entry_priority(w.get("confidence"), to_go), 4),
                 "added_ts": added, "expires_ts": added + cfg.watch_max_hours * 3600,
                 "checked_ts": w.get("checked_ts"),
                 "order": ({k: pend[sym].get(k) for k in
                            ("limit", "size", "target_spot", "order_id", "placed_ts")}
-                          | {"kind": pend[sym]["instrument"]["kind"]}
+                          | {"kind": pend[sym]["instrument"]["kind"],
+                             "current_price": pend[sym].get("last_price")}
                           if sym in pend else None),
             })
-        # Closest to its entry first; not-yet-measured entries last.
-        rows.sort(key=lambda r: (r["sigma_to_go"] is None, r["sigma_to_go"] or 0.0,
-                                 -(r["confidence"] or 0)))
+        # Same ranking the engine uses for order slots: confidence x2 + closeness.
+        rows.sort(key=lambda r: -r["priority"])
         return SafeJSONResponse(rows)
 
     @app.get("/api/signals")
@@ -375,7 +411,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         recent decision per symbol so the tab reads as 'current strong signals'."""
         seen: set[str] = set()
         out = []
-        for a in store().recent_activity(limit):
+        activity: list[dict] = []
+        for book in research_books():
+            activity = [a for a in book.recent_activity(limit) if a.get("kind") == "decision"]
+            if activity:
+                break
+        for a in activity:
             if a.get("kind") != "decision":
                 continue
             d = a.get("detail") or {}
