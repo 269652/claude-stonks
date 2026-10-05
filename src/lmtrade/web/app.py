@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,8 @@ from ..core.control import LOW_BALANCE_EUR, ControlState
 from ..core.engine import OPTION_FEE
 from ..core.exits import exit_plan, pnl_for_premium, validate_override
 from ..core.limit_orders import entry_priority
+from ..core.budget import split_cash
+from ..core.market_hours import market_status
 from ..core.state import Store
 from . import settings_editor
 
@@ -141,6 +144,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         v = store_for("live").get_meta(key)
         return v if v is not None else store_for("paper").get_meta(key)
 
+    def _market() -> dict:
+        """Venue open/closed for real (armed live) closes; the paper book
+        and an unarmed view can always close (locally)."""
+        ctrl = control()
+        if not (ctrl.mode == "live" and ctrl.armed):
+            return {"open": True, "next_open": None, "closes": None}
+        until = store_for("live").get_meta("market_closed_until")
+        return market_status(time.time(), settings.tr.market_hours,
+                             float(until) if until else None)
+
+    def _buckets(book: Store, cash: float | None) -> dict | None:
+        """Cash split entry / dips / reserve, as the engine applies it."""
+        if cash is None:
+            return None
+        adds = book.get_meta("dip_adds") or {}
+        open_ids = {str(o["id"]) for o in book.open_options()}
+        spent = sum(float(a["size"]) * float(a["price"])
+                    for k, lst in adds.items() if k in open_ids for a in lst)
+        b = settings.budget_split
+        return {k: round(v, 2) for k, v in
+                split_cash(float(cash), b.reserve_eur, b.dips_eur, spent).items()}
+
     @app.get("/api/summary")
     def summary() -> JSONResponse:
         ctrl = control()
@@ -151,6 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # book, so its rows get no close / exit-edit handles.
         book = view_book()
         can_act = not is_live or ctrl.armed
+        market = _market()
         equity_positions = book.positions()
         open_opts = book.open_options()
         tr_cash = _tr_meta("tr_account_cash")
@@ -242,6 +268,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "id": o.get("id"), "close_kind": "option" if can_act else None,
                 "close_symbol": None,
                 "close_pending": {"kind": "option", "id": o.get("id")} in pending,
+                "close_blocked": not market["open"],
             })
         return SafeJSONResponse({
             "mode": store().get_meta("mode", settings.mode),
@@ -259,6 +286,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "num_positions": len(rows),
             "provider_warnings": store().get_meta("provider_warnings"),
             "tr_session": _tr_meta("tr_session"),
+            "market": market,
+            "cash_buckets": _buckets(book, cash),
+            "position_commentary": book.get_meta("position_commentary"),
             "alpha": store().get_meta("alpha"),
         })
 
@@ -550,6 +580,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"queued": False,
                  "error": "expected {kind:'option', id:int} or {kind:'equity', symbol:str}"},
                 status_code=400)
+        if not _market()["open"]:
+            return SafeJSONResponse(
+                {"queued": False, "error": "market closed — closing is possible once it opens"},
+                status_code=409)
         reqs = store().get_meta("close_requests") or []
         if req not in reqs:
             store().set_meta("close_requests", reqs + [req])

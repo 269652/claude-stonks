@@ -75,7 +75,6 @@ single call where the AskUserQuestion tool allows multiple questions at once.
     - `PERPLEXITY_API_KEY` — in-engine hourly news fetch (separate from, and
       redundant with, the Routine's own news-gathering — most users won't
       need this if they're using the hourly Routine).
-    - `VAST_API_KEY` — only if deploying to a Vast.ai GPU box.
     - Ollama host / SLM model — only if running a local SLM.
 11. **Trade Republic credentials** — ask in two cases. (a) The user chose
     `live` mode in question 1, or (b) the user wants **paper trading on

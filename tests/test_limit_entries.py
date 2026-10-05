@@ -86,6 +86,7 @@ def settings(tmp_path: Path) -> Settings:
     s.entry.watch_k = 1.0
     s.entry.watch_window = 60
     s.entry.limit_orders = True
+    s.tr.market_hours = ""             # always open: these tests run at any hour
     return s
 
 

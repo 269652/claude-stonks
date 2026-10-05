@@ -32,7 +32,9 @@ async function refresh() {
     window._ctrl = ctrl;
     paintControl(ctrl, s);
     paintSummary(s);
+    paintMarket(s.market);
     paintPositions(s.positions);
+    paintCommentary(s.position_commentary);
     paintTrades(trades);
     paintActivity(activity);
     paintLogs(logs);
@@ -153,6 +155,13 @@ function paintSummary(s) {
   const cashEl = $("cash");
   cashEl.textContent = cash != null ? fmt(cash) + " " + cur : "—";
   cashEl.className = "v" + (isLive && ctrl.low_balance ? " warn" : "");
+  // Cash buckets: entries / dip buys / manual reserve.
+  const b = s.cash_buckets;
+  $("curr").textContent = b && (b.dips > 0 || b.reserve > 0)
+    ? `entries ${fmt(b.entry)} · dips ${fmt(b.dips)} · reserve ${fmt(b.reserve)}`
+    : cur;
+  $("curr").title = "Cash split: new entries / dip buys into held positions / "
+    + "reserve for your manual actions (Settings → budget_split)";
   $("reserve").textContent = fmt(s.reserve != null ? s.reserve : (econ.reserve_eur || 0)) + " " + cur;
   $("npos").textContent = s.num_positions;
   const banner = $("econ");
@@ -248,9 +257,60 @@ function exitsCell(p) {
 function closeButton(p) {
   if (!p.close_kind) return "<td></td>";
   if (p.close_pending) return `<td><button class="close-btn" disabled>closing…</button></td>`;
+  if (p.close_blocked) return `<td><button class="close-btn" disabled`
+    + ` title="Market closed — ${marketOpensText(window._market)}">Close</button></td>`;
   const attrs = p.close_kind === "option" ? `data-id="${p.id}"` : `data-symbol="${p.close_symbol}"`;
   return `<td><button class="close-btn" data-kind="${p.close_kind}" ${attrs}`
     + ` data-label="${p.symbol}">Close</button></td>`;
+}
+
+// Venue hours (armed live): closing is only possible while the market is
+// open. A banner says when it opens; on reopening a toast + a browser
+// notification (if allowed) say so.
+function marketOpensText(m) {
+  if (!m || !m.next_open) return "opens again at the next trading session";
+  const d = new Date(m.next_open * 1000);
+  return "opens " + d.toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
+}
+function notifyMarketOpen() {
+  const msg = "Market open — positions can be closed again.";
+  const t = $("market-toast");
+  t.textContent = "🔔 " + msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 15000);
+  if ("Notification" in window && Notification.permission === "granted") {
+    try { new Notification("LMTrade", {body: msg}); } catch (e) { /* not supported */ }
+  }
+}
+function paintMarket(m) {
+  const prev = window._market;
+  window._market = m;
+  const banner = $("market-banner");
+  if (m && m.open === false) {
+    banner.innerHTML = `🌙 <b>Market closed</b> — ${marketOpensText(m)}. Closing positions is disabled until then.`;
+    banner.classList.add("show");
+    // Ask once (on the next click — browsers want a user gesture) so the
+    // reopening can be announced even when this tab is in the background.
+    if ("Notification" in window && Notification.permission === "default" && !window._askedNotify) {
+      window._askedNotify = true;
+      document.addEventListener("click", () => Notification.requestPermission(), {once: true});
+    }
+  } else {
+    banner.classList.remove("show");
+  }
+  if (prev && prev.open === false && m && m.open) notifyMarketOpen();
+}
+
+// Claude's live take on the open positions (refreshed by the engine every
+// research.commentary_minutes).
+function paintCommentary(c) {
+  const box = $("pos-commentary");
+  if (!c || !c.text) { box.classList.remove("show"); return; }
+  const model = (c.model || "").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+  box.innerHTML = `💬 ${c.text}<div class="meta">Claude ${model} · updated ${time(c.ts)}`
+    + `${c.error ? " · last refresh failed" : ""}</div>`;
+  // Colour by Claude's opening verdict: fine (green), watch (amber), bad (red).
+  box.className = "pos-commentary show" + (c.verdict ? " v-" + c.verdict : "");
 }
 
 function paintPositions(rows) {

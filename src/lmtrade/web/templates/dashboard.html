@@ -66,6 +66,13 @@
                               font-size:13px; background:rgba(210,100,34,.12);
                               border:1px solid var(--red); color:var(--text); }
   .provider-warning-banner.show { display:block; }
+  .market-banner { display:none; margin-top:10px; padding:8px 14px; border-radius:10px;
+    border:1px solid var(--line); color:var(--muted); font-size:13px; }
+  .market-banner.show { display:block; }
+  .market-toast { display:none; position:fixed; right:16px; bottom:16px; z-index:50;
+    padding:12px 16px; border-radius:10px; border:1px solid var(--green);
+    background:var(--panel, #161b22); color:var(--green); font-weight:600; }
+  .market-toast.show { display:block; }
   .muted { color:var(--muted); }
   .num.pos { color:var(--green); } .num.neg { color:var(--red); }
   svg#chart { width:100%; height:120px; display:block; overflow:visible; }
@@ -105,6 +112,14 @@
              color:var(--text); border-radius:4px; padding:1px 4px; font-size:12px; }
   input.inline-exit-input.bad { border-color:var(--red); }
   .exits-wrap { display:flex; align-items:center; gap:10px; }
+  .pos-commentary { display:none; margin:6px 0 12px; padding:10px 14px; border-radius:10px;
+                    border:1px solid var(--blue); background:rgba(88,166,255,.08);
+                    font-size:13px; line-height:1.5; }
+  .pos-commentary.show { display:block; }
+  .pos-commentary.v-fine { border-color:var(--green); background:rgba(63,185,80,.08); }
+  .pos-commentary.v-watch { border-color:var(--amber); background:rgba(210,153,34,.10); }
+  .pos-commentary.v-bad { border-color:var(--red); background:rgba(248,81,73,.10); }
+  .pos-commentary .meta { color:var(--muted); font-size:11px; margin-top:4px; }
   .exits-btn { cursor:pointer; background:transparent; border:1px solid var(--line);
                color:var(--muted); border-radius:6px; padding:3px 8px; font-size:13px;
                line-height:1; flex:none; }
@@ -238,6 +253,8 @@
   <div id="exec-banner" class="exec-banner"><span class="ic" id="exec-ic"></span><span id="exec-text"></span></div>
   <div id="econ" class="econ-banner econ-ok">loading economics…</div>
   <div id="provider-warning-banner" class="provider-warning-banner"></div>
+  <div id="market-banner" class="market-banner"></div>
+  <div id="market-toast" class="market-toast" role="status"></div>
 
   <div class="grid" style="margin-top:16px;">
     <div class="card"><div class="k">Net Worth</div><div class="v" id="net">—</div><div class="sub" id="pnl">—</div></div>
@@ -273,6 +290,7 @@
   </div>
 
   <section id="tab-positions">
+    <div id="pos-commentary" class="pos-commentary"></div>
     <table><thead><tr><th>Symbol</th><th>Type</th><th>ISIN</th><th>Qty</th><th>Avg Price</th><th>Price</th><th>Value</th><th>P&amp;L</th><th>Exits</th><th></th></tr></thead>
       <tbody id="positions"></tbody></table>
   </section>

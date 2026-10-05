@@ -3,7 +3,6 @@
     lmtrade run            # start the trading engine (paper by default)
     lmtrade web            # launch the dashboard
     lmtrade status         # print current portfolio + economics
-    lmtrade deploy         # print/inspect a Vast.ai deployment plan
     lmtrade reset          # wipe runtime state (fresh account)
     lmtrade config         # show the resolved configuration
 """
@@ -303,37 +302,6 @@ def status():
         lt.add_row("—", "—", "—", "—", "—")
     console.print(lt)
     store.close()
-
-
-@app.command()
-def deploy(
-    gpu: str = typer.Option("RTX_3090", help="GPU type to price on Vast.ai."),
-):
-    """Inspect a Vast.ai deployment plan (cheapest GPU offers + current burn)."""
-    from .infra.vast import cheapest_offers, current_hourly_burn
-
-    settings = load_settings()
-    console.print(Panel.fit(
-        "Deployment plan:\n"
-        "1. Provision a Vast.ai GPU instance (see scripts/deploy_vast.sh).\n"
-        "2. On the box: install Ollama + pull the SLM, `pip install -e .`.\n"
-        "3. Set .env (keys, GPU rate), run `lmtrade run` and `lmtrade web`.\n"
-        f"4. Economics floor: halt trading below {settings.economics.min_runway_hours}h runway.",
-        title="🚀 deploy", border_style="cyan",
-    ))
-    offers = cheapest_offers(gpu)
-    if offers is None:
-        console.print("[yellow]Set VAST_API_KEY to fetch live GPU offers.[/yellow]")
-    else:
-        t = Table(title=f"Cheapest {gpu} offers")
-        t.add_column("ID"); t.add_column("GPU"); t.add_column("USD/hr", justify="right")
-        t.add_column("Region")
-        for o in offers:
-            t.add_row(str(o["id"]), str(o["gpu"]), f"{o['usd_per_hour']}", str(o["region"]))
-        console.print(t)
-    burn = current_hourly_burn()
-    if burn is not None:
-        console.print(f"Current Vast.ai burn: [bold]${burn}/hr[/bold]")
 
 
 @app.command("import-news")

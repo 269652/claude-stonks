@@ -16,6 +16,7 @@ Per cycle:
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Callable
 
@@ -47,12 +48,26 @@ from .events import EventBus
 from .scheduler import Scheduler
 from .state import Position, Store, Trade
 from .exits import exit_plan
+from .budget import split_cash
+from .market_hours import market_status, next_open
+from .signoff import SignOff
 from .limit_orders import entry_priority, needs_reprice, relative_sigma_pct, target_spot
 from .watchlist import entry_z, should_enter
 
 OPTION_FEE = 1.0   # per option/knockout order: TR's flat 1 EUR fee, charged on
                    # entry AND exit and included in every P&L figure
 NEWS_MAX_AGE_S = 24 * 3600   # news older than this no longer influences decisions
+def exit_price(q: Quote) -> float:
+    """De-spiked price for exit decisions: the median of the last three
+    bars (the latest being q.price). One outlier print / bar — live
+    incident: a thin after-hours tick armed and fired a trailing stop —
+    can't trigger an exit; a move confirmed by a second bar does."""
+    hist = [float(x) for x in (q.history or [])[-3:]]
+    if not hist or hist[-1] != q.price:
+        hist = (hist + [q.price])[-3:]
+    return sorted(hist)[len(hist) // 2] if len(hist) == 3 else q.price
+
+
 LIVE_EXIT_RETRY_S = 5 * 60   # after a rejected live sell, retry automatic exits this often
 ANALYSIS_RETRY_S = 15 * 60   # when analysis is missing/unusable, retry this often
                              # (not every cycle) so a provider outage doesn't hammer
@@ -83,6 +98,8 @@ class Engine:
             tr_derivatives = build_tr_derivatives(settings)
         self.tr_derivatives = tr_derivatives
         self._last_good_price: dict[str, float] = {}
+        self._last_bars: dict[str, list[float]] = {}   # latest quote history per symbol
+        self.signoff = SignOff(settings)
         self.fusion = FusionEngine(settings, build_providers(settings))
         self.accountant = CostAccountant(settings, store)
         self.scheduler = Scheduler(store, now=now)
@@ -102,6 +119,13 @@ class Engine:
         self._last_portfolio_check = 0.0  # wall clock of the last live fill reconciliation
         self._last_cash: float | None = None   # last successfully read cash
         self._last_heartbeat = 0.0               # wall clock of the last TR heartbeat
+        self.fusion.llm_async = True             # LLM votes never block the loop
+        # Position commentary (research/commentary.py): "auto" builds the
+        # configured Claude caller lazily; tests inject a fake and run inline.
+        self.commentary_caller = "auto"
+        self.commentary_async = True
+        self._commentary_thread = None
+        self._last_commentary = 0.0
         self._last_equity_point = 0.0           # wall clock of the last equity point
         self._fast_exit_checks = 0
         store.set_meta("mode", broker.mode)
@@ -303,12 +327,14 @@ class Engine:
             self.store.set_meta("benchmark_entry", entry)
         bench_equity = self.settings.budget * (price / entry["price"])
         self.store.record_benchmark(bench_equity)
-        cash = self.broker.cash()
+        cash = self._cash()
         bot_equity = cash + self._positions_value(prices) + self._options_value(prices)
         self.store.set_meta("alpha", round(bot_equity - bench_equity, 6))
 
     # ------------------------------------------------------------ option exits
     def _manage_options(self, prices: dict[str, float], tradeable: set[str]) -> None:
+        if not self._market_status()["open"]:
+            return   # venue closed: no sells possible, after-hours prints are thin
         cfg = self.settings.options
         peaks: dict = self.store.get_meta("trail_peaks") or {}
         overrides: dict = self.store.get_meta("exit_overrides") or {}
@@ -394,17 +420,75 @@ class Engine:
                     f"stale ({age_h:.0f}h, {pnl_pct:+.1%}): freeing slot for stronger signal",
                     label="STALE CLOSE")
 
+    def _cash(self) -> float:
+        """Broker cash; a failed TR read (0.0 with last_cash_ok False) falls
+        back to the last good value instead of counting as a real zero."""
+        c = self.broker.cash()
+        if getattr(self.broker, "last_cash_ok", True) is False:
+            return getattr(self, "_last_good_cash", c)
+        self._last_good_cash = c
+        return c
+
+    def _sign_off(self, order: dict) -> bool:
+        """Claude reviews an automatic live order (core/signoff.py)."""
+        order = {**order, "bars": self._last_bars.get(order["symbol"], [])}
+        ok, why = self.signoff.review(order)
+        if not self.settings.signoff.enabled:
+            return ok
+        what = f"{order['side'].upper()} {order['size']:g} x {order['symbol']} [{order['isin']}]"
+        if ok:
+            self.bus.info(f"[sign-off] APPROVED {what} — {why}", source="engine")
+        else:
+            self.bus.warn(f"[sign-off] REJECTED {what} — {why}", source="engine")
+            self.bus.activity("risk", f"sign-off rejected {what}: {why}", order["symbol"])
+        return ok
+
+    def _market_status(self) -> dict:
+        """Venue open/closed for ARMED live trading (paper is never gated)."""
+        now = self.now()
+        if not self._live_armed():
+            return {"open": True, "next_open": None, "closes": None}
+        until = self.store.get_meta("market_closed_until")
+        return market_status(now, self.settings.tr.market_hours,
+                             float(until) if until else None)
+
+    def _learn_market_closed(self, now: float) -> None:
+        """TR said the exchange is closed (e.g. a holiday): treat it as closed
+        until the next scheduled opening after now."""
+        nxt = next_open(now + 60, self.settings.tr.market_hours) or now + LIVE_EXIT_RETRY_S
+        self.store.set_meta("market_closed_until", nxt)
+        self.bus.warn("[market] TR reports the exchange closed — exits wait until it "
+                      "opens again.", source="engine")
+
+    def _publish_market_status(self) -> None:
+        """meta market_status for the dashboard; announces each reopening."""
+        st = dict(self._market_status())
+        prev = self.store.get_meta("market_status") or {}
+        st["opened_ts"] = prev.get("opened_ts")
+        if st["open"] and prev.get("open") is False:
+            st["opened_ts"] = self.now()
+            self.bus.activity("system", "Market open — trading and closing possible again")
+        if st != prev:
+            self.store.set_meta("market_status", st)
+
     def _live_armed(self) -> bool:
         return bool(getattr(self.broker, "armed", False)) and hasattr(self.broker, "place_order")
 
     def _exit_option(self, o: dict, mark: float, reason: str, label: str = "CLOSE",
-                     live_order: bool = True, manual: bool = False) -> bool:
+                     live_order: bool = True, manual: bool = False,
+                     confidence: float = 1.0) -> bool:
         """Close a position. In ARMED live mode a real TR sell order for the
         certificate's ISIN goes out first, and the close is only booked once
         TR confirms it; on rejection the position stays open and automatic
         retries back off for LIVE_EXIT_RETRY_S (a manual close always tries).
         `live_order=False` for a knock-out, which TR settles itself. Returns
         True when the close was booked."""
+        if not (self._live_armed() and live_order and o.get("isin") and not manual
+                and self._exit_retry_at.get(o["id"], 0.0) > self.now()):
+            # Every exit is an exit signal; hard exits (TP / SL / trailing /
+            # knock-out / expiry / manual) carry full confidence.
+            self.bus.info(f"[exit-signal] {o['underlying']} conf {confidence:.2f} — {reason}",
+                          source="engine")
         if self._live_armed() and live_order:
             isin = o.get("isin")
             if not isin:
@@ -418,10 +502,22 @@ class Engine:
                     return False
                 size = float(int(o["contracts"]))   # whole certificates
                 ref = (self.store.get_meta("ko_refs") or {}).get(str(o["id"])) or {}
+                if not manual and not self._sign_off({
+                        "side": "sell", "symbol": o["underlying"], "isin": isin,
+                        "size": size, "kind": o["kind"], "reason": reason,
+                        "price": round(mark, 4), "entry": o["entry_premium"],
+                        "pnl_eur": round((mark - o["entry_premium"]) * o["contracts"]
+                                         - 2 * OPTION_FEE, 2),
+                        "spot": self._last_good_price.get(o["underlying"]),
+                        "barrier": o.get("barrier")}):
+                    self._exit_retry_at[o["id"]] = now + LIVE_EXIT_RETRY_S
+                    return False
                 res = self.broker.place_order(isin, "sell", size,
                                               exchange=ref.get("exchange") or "LSX")
                 if not res.ok:
                     self._exit_retry_at[o["id"]] = now + LIVE_EXIT_RETRY_S
+                    if "exchangeclosed" in str(res.message).lower().replace(" ", ""):
+                        self._learn_market_closed(now)
                     self.bus.warn(
                         f"LIVE exit {o['underlying']} [{isin}] rejected/unconfirmed — "
                         f"position stays open ({reason}): {res.message}", source="engine")
@@ -430,6 +526,126 @@ class Engine:
                 reason = f"{reason} [live sell confirmed: {res.message}]"
         self._book_option_close(o, mark, reason, label=label)
         return True
+
+    def _signal_exits(self, quotes: dict[str, Quote], tradeable: set[str]) -> None:
+        """Close held positions whose underlying's fused signal points against
+        them with confidence >= options.flip_exit_confidence."""
+        cfg = self.settings.options
+        thr = cfg.flip_exit_confidence
+        if thr <= 0:
+            return
+        now = self.now()
+        for o in list(self.store.open_options()):
+            sym = o["underlying"]
+            if sym not in tradeable or sym not in quotes:
+                continue
+            if (now - float(o["opened_ts"])) / 3600.0 < cfg.min_hold_hours:
+                continue
+            is_long = o["kind"] in ("call", "ko_call")
+            self._held_hint = "long" if is_long else "short"   # the LLM must know
+            try:
+                decision, _ = self._decide(quotes[sym])
+            finally:
+                self._held_hint = None
+            self.bus.activity("decision",
+                              f"{sym}: {decision.direction.upper()} conf "
+                              f"{decision.confidence:.2f} (held)", sym, decision.as_dict())
+            against = ((is_long and decision.direction == "sell")
+                       or (not is_long and decision.direction == "buy"))
+            if not against or decision.confidence < thr:
+                continue
+            mark = self._mark_position(o, quotes[sym].price)
+            self._exit_option(
+                o, mark,
+                f"signal exit: {decision.direction.upper()} conf {decision.confidence:.2f} "
+                f"against held {'long' if is_long else 'short'}",
+                label="SIGNAL EXIT", confidence=decision.confidence)
+
+    def _buckets(self, cash: float | None = None) -> dict:
+        """Cash split into entry / dips / reserve (core/budget.py). Dip buys
+        of positions still open count against the dip budget."""
+        b = self.settings.budget_split
+        adds = self.store.get_meta("dip_adds") or {}
+        open_ids = {str(o["id"]) for o in self.store.open_options()}
+        spent = sum(float(a["size"]) * float(a["price"])
+                    for k, lst in adds.items() if k in open_ids for a in lst)
+        return split_cash(self._cash() if cash is None else cash,
+                          b.reserve_eur, b.dips_eur, spent)
+
+    def _dip_buys(self, quotes: dict[str, Quote], tradeable: set[str]) -> None:
+        """Average down a held, losing position from the dip budget when its
+        underlying dipped >= dips.k_sigma against it and the fused signal
+        still backs it. Same live guards as every order."""
+        cfg = self.settings.dips
+        if not cfg.enabled or self.settings.budget_split.dips_eur <= 0:
+            return
+        if not self._market_status()["open"]:
+            return
+        adds: dict = self.store.get_meta("dip_adds") or {}
+        for o in list(self.store.open_options()):
+            sym, key = o["underlying"], str(o["id"])
+            if sym not in tradeable or sym not in quotes:
+                continue
+            if len(adds.get(key, [])) >= cfg.max_adds:
+                continue
+            q = quotes[sym]
+            is_long = o["kind"] in ("call", "ko_call")
+            direction = "buy" if is_long else "sell"
+            z = entry_z(q.price, q.history, self.settings.entry.watch_window)
+            if not should_enter(direction, z, cfg.k_sigma):
+                continue
+            if (o.get("barrier") and q.price > 0
+                    and abs(q.price - o["barrier"]) / q.price < cfg.min_barrier_distance):
+                continue
+            mark = self._mark_position(o, q.price)
+            if mark <= 0 or mark >= o["entry_premium"]:
+                continue   # averaging DOWN only
+            self._held_hint = "long" if is_long else "short"
+            try:
+                decision, _ = self._decide(q)
+            finally:
+                self._held_hint = None
+            if decision.direction != direction or decision.confidence < cfg.min_confidence:
+                continue
+            room = self._buckets()["dips"] - OPTION_FEE
+            size = math.floor(room / mark) if room > 0 else 0
+            if size < 1 or not fee_ratio_ok(size * mark, OPTION_FEE, cfg.max_fee_pct):
+                continue
+            price = mark
+            why = (f"dip buy: {sym} {z:+.1f} sigma vs SMA, signal {direction.upper()} "
+                   f"conf {decision.confidence:.2f}, position {mark:.3f} < entry "
+                   f"{o['entry_premium']:.3f}")
+            if self._live_armed():
+                if not o.get("isin"):
+                    continue
+                if not self._sign_off({
+                        "side": "buy", "symbol": sym, "isin": o["isin"], "size": size,
+                        "kind": o["kind"], "price": round(mark, 4),
+                        "value_eur": round(size * mark, 2), "spot": q.price,
+                        "barrier": o.get("barrier"), "held": o["contracts"],
+                        "entry": o["entry_premium"], "reason": why}):
+                    continue
+                ref = (self.store.get_meta("ko_refs") or {}).get(key) or {}
+                res = self.broker.place_order(o["isin"], "buy", float(size),
+                                              exchange=ref.get("exchange") or "LSX")
+                if not res.ok:
+                    self.bus.warn(f"LIVE dip buy {sym} [{o['isin']}] rejected: {res.message}",
+                                  source="engine")
+                    continue
+                price = float(getattr(res, "price", None) or mark)
+            elif not self.broker.adjust_cash(-(size * price + OPTION_FEE)):
+                continue
+            self.store.record_cost("fee", OPTION_FEE, "options")
+            self.store.add_to_option(o["id"], float(size), price)
+            adds.setdefault(key, []).append({"ts": self.now(), "size": size, "price": price})
+            self.store.set_meta("dip_adds", adds)
+            peaks = self.store.get_meta("trail_peaks") or {}
+            if peaks.pop(key, None) is not None:   # P&L baseline changed
+                self.store.set_meta("trail_peaks", peaks)
+            self.store.record_trade(Trade(sym, "buy", float(size), price, OPTION_FEE,
+                                          self.broker.mode, why, o.get("genome_id")))
+            self.bus.activity("trade", f"DIP BUY {o['kind'].upper()} {sym} x{size} @ "
+                                       f"{price:.3f} — {why}", sym)
 
     def _book_option_close(self, o: dict, mark: float, reason: str,
                            label: str = "CLOSE") -> float:
@@ -442,7 +658,7 @@ class Engine:
         self.broker.adjust_cash(max(0.0, proceeds))
         self.store.record_cost("fee", OPTION_FEE, "options")
         self.store.close_option(o["id"], mark, pnl)
-        for key in ("trail_peaks", "exit_overrides", "ko_refs"):
+        for key in ("trail_peaks", "exit_overrides", "ko_refs", "dip_adds"):
             state = self.store.get_meta(key) or {}
             if state.pop(str(o["id"]), None) is not None:
                 self.store.set_meta(key, state)
@@ -549,6 +765,7 @@ class Engine:
             return
         self._fast_exit_checks += 1
         prices: dict[str, float] = {}
+        exit_prices: dict[str, float] = {}
         tradeable: set[str] = set()
         for symbol in held:
             try:
@@ -557,10 +774,12 @@ class Engine:
                 continue
             if self._is_trustworthy(q):
                 prices[symbol] = q.price
+                exit_prices[symbol] = exit_price(q)
+                self._last_bars[symbol] = list(q.history or [])[-30:]
                 self._last_good_price[symbol] = q.price
                 tradeable.add(symbol)
         if tradeable:
-            self._manage_options(prices, tradeable)
+            self._manage_options(exit_prices, tradeable)
             self._persist_option_marks(prices)
             self._record_equity_point(prices)
 
@@ -568,7 +787,7 @@ class Engine:
         """Net worth for the low-balance guard: cash + holdings after the exit
         fee each still costs (not cash alone — cash drops when it's invested)."""
         prices = self._last_good_price
-        return (self.broker.cash() + self._positions_value(prices)
+        return (self._cash() + self._positions_value(prices)
                 + self._options_value(prices) - self._open_exit_fees())
 
     def _open_exit_fees(self) -> float:
@@ -590,7 +809,7 @@ class Engine:
                 return
             cash = self._last_cash
         else:
-            cash = self.broker.cash()
+            cash = self._cash()
         all_prices = {**self._last_good_price, **prices}
         equity = (cash + self._positions_value(all_prices) + self._options_value(all_prices)
                   - self._open_exit_fees())
@@ -639,6 +858,88 @@ class Engine:
                                            "since": was.get("since") if was.get("ok") is False
                                            else now, "msg": msg})
 
+    def _commentary_rows(self) -> list[dict]:
+        marks = self.store.get_meta("open_option_marks") or {}
+        overrides = self.store.get_meta("exit_overrides") or {}
+        refs = self.store.get_meta("ko_refs") or {}
+        now = self.now()
+        rows = []
+        for o in self.store.open_options():
+            m = marks.get(str(o["id"])) or {}
+            plan = exit_plan(o, self.settings.options, overrides.get(str(o["id"])), OPTION_FEE)
+            entry, price = float(o["entry_premium"]), m.get("mark_premium")
+            ref_spot = (refs.get(str(o["id"])) or {}).get("spot")
+            spot = m.get("spot")
+            if m.get("trail_active"):
+                trail = f"active, stop {m.get('trail_stop_pnl'):+.2f} EUR"
+            elif plan.trail_enabled:
+                trail = f"arms at {plan.trail_min / (1 - plan.trail_pct):+.2f} EUR"
+            else:
+                trail = "off"
+            rows.append({
+                "symbol": o["underlying"],
+                "direction": "long" if o["kind"] in ("call", "ko_call") else "short",
+                "entry": entry, "price": price, "pnl_eur": m.get("unrealized_pnl"),
+                "pnl_pct": None if price is None else (price - entry) / entry * 100,
+                "tp": plan.tp, "sl": plan.sl, "trail": trail,
+                "held_min": int((now - float(o["opened_ts"])) / 60),
+                "spot": spot,
+                "spot_move_pct": (None if not (spot and ref_spot)
+                                  else (spot - ref_spot) / ref_spot * 100),
+            })
+        return rows
+
+    def _position_commentary_tick(self) -> None:
+        """Every research.commentary_minutes while positions are open: ~300
+        characters of Claude commentary for the dashboard (in the background,
+        so trading never waits on it)."""
+        minutes = self.settings.research.commentary_minutes
+        if minutes <= 0:
+            return
+        if not self._market_status()["open"]:
+            return   # market closed: nothing moves, keep the last commentary
+        if not self.store.open_options():
+            if self.store.get_meta("position_commentary") is not None:
+                self.store.set_meta("position_commentary", None)
+            return
+        now = time.time()
+        if now - self._last_commentary < minutes * 60:
+            return
+        if self._commentary_thread is not None and self._commentary_thread.is_alive():
+            return
+        self._last_commentary = now
+        if self.commentary_caller == "auto":
+            from ..research.commentary import make_caller
+            self.commentary_caller = make_caller(self.settings)
+        caller = self.commentary_caller
+        if caller is None:
+            return
+        from ..research.commentary import build_prompt, clean_commentary, parse_verdict
+        rows = self._commentary_rows()
+        prompt = build_prompt(rows, 300)
+
+        def job() -> None:
+            prev = self.store.get_meta("position_commentary") or {}
+            try:
+                text = clean_commentary(caller(prompt), 300)
+            except Exception as exc:  # noqa: BLE001 — commentary must never break trading
+                self.store.set_meta("position_commentary",
+                                    {**prev, "error": str(exc)[:200], "error_ts": time.time()})
+                return
+            if text:
+                self.store.set_meta("position_commentary", {
+                    "text": text, "ts": time.time(), "verdict": parse_verdict(text),
+                    "model": self.settings.research.commentary_model,
+                    "symbols": [r["symbol"] for r in rows]})
+
+        if self.commentary_async:
+            import threading
+            self._commentary_thread = threading.Thread(target=job, daemon=True,
+                                                       name="position-commentary")
+            self._commentary_thread.start()
+        else:
+            job()
+
     def _poll_close_requests(self) -> None:
         if self.store.get_meta("close_requests"):
             self.process_close_requests()
@@ -654,6 +955,8 @@ class Engine:
             self._poll_close_requests()
             self._check_exits_fast()
             self._tr_heartbeat()
+            self._publish_market_status()
+            self._position_commentary_tick()
 
     def _record_learning(self, genome_id: str | None, pnl: float) -> None:
         if not (self.optimizer and genome_id):
@@ -670,8 +973,33 @@ class Engine:
                     detail={"params": mutant.params})
 
     # ---------------------------------------------------------------- entries
+    def _daily_universe(self) -> dict[str, list[float]]:
+        """Daily closes for the universe (cached by the market layer)."""
+        if not hasattr(self.market, "daily_closes"):
+            return {}
+        out = {}
+        for sym in self.settings.universe:
+            try:
+                c = self.market.daily_closes(sym)
+            except Exception:  # noqa: BLE001
+                c = None
+            if c:
+                out[sym] = c
+        return out
+
+    def _evidence_signal(self, symbol: str) -> Signal | None:
+        from ..strategies.evidence import evidence_vote
+        universe = self._daily_universe()
+        if symbol not in universe:
+            return None
+        direction, conf, why = evidence_vote(symbol, universe)
+        return Signal("evidence", direction, conf, f"daily rules: {why}", 0.0)
+
     def _decide(self, quote: Quote) -> tuple[Decision, str | None]:
         extra: list[Signal] = []
+        ev = self._evidence_signal(quote.symbol)
+        if ev is not None:
+            extra.append(ev)
         genome_id = None
         if self.optimizer:
             genome = self.optimizer.select()
@@ -688,6 +1016,8 @@ class Engine:
                                 f"{genome.strategy} {genome.params}", 0.0))
             genome_id = genome.id
         ctx: dict = {}
+        if getattr(self, "_held_hint", None):
+            ctx["held"] = self._held_hint
         latest = self.store.latest_news(quote.symbol)
         if latest and (self.now() - latest["ts"]) < NEWS_MAX_AGE_S:
             ctx["research"] = latest["text"]
@@ -744,7 +1074,7 @@ class Engine:
         after profitable runs without any manual parameter changes."""
         cfg = self.settings.options
         s = self.settings.sizing
-        cash = self.broker.cash()
+        cash = self._cash()
         # Use all last-known prices for a portfolio-wide equity estimate,
         # not just the current quote — options on OTHER symbols have value too.
         all_prices = {**self._last_good_price, quote.symbol: quote.price}
@@ -774,10 +1104,12 @@ class Engine:
                        if s != quote.symbol)
         deployed += reserved
         cash -= reserved
+        # Cash buckets: the manual reserve and the dip budget aren't for entries.
+        entry_cash = self._buckets(cash)["entry"]
         max_deployable = equity * (1.0 - cfg.cash_reserve_pct)
         available = max(0.0, max_deployable - deployed)
 
-        ceiling = min(cfg.max_option_fraction * equity, available, cash - OPTION_FEE)
+        ceiling = min(cfg.max_option_fraction * equity, available, entry_cash - OPTION_FEE)
         return min(fraction * equity, ceiling), ceiling
 
     def _watchlist_triggers(self, candidates: list[tuple[Decision, str | None]],
@@ -834,8 +1166,11 @@ class Engine:
             # For the dashboard's Watchlist tab: where price is right now.
             wl[sym]["z"] = None if z is None else round(z, 4)
             wl[sym]["checked_ts"] = now
-            # High-confidence signals skip the timing entirely.
-            instant = decision.confidence >= cfg.instant_confidence
+            # High-confidence signals skip the timing — but only when the
+            # heuristics, news and analysis support them (none against, at
+            # least one for).
+            instant = (decision.confidence >= cfg.instant_confidence
+                       and self._supported_by_context(decision))
             wl[sym]["instant"] = instant
             # Prices for the dashboard: underlying now and the entry target.
             tgt = (quote.price if instant else
@@ -857,6 +1192,13 @@ class Engine:
         self.store.set_meta("watchlist", wl)
         self.store.set_meta("watchlist_expired", expired)
         return triggered
+
+    SUPPORT_PROVIDERS = ("heuristic", "news", "analysis")
+
+    def _supported_by_context(self, decision: Decision) -> bool:
+        votes = [s.direction for s in (decision.signals or [])
+                 if s.provider in self.SUPPORT_PROVIDERS and s.direction != "hold"]
+        return bool(votes) and all(v == decision.direction for v in votes)
 
     def _tr_tradable(self, symbol: str, direction: str) -> bool:
         """Whether TR offers a knockout for this signal (right direction,
@@ -995,6 +1337,14 @@ class Engine:
                 self.bus.warn(f"LIVE limit order blocked [{inst['isin']}]: balance under "
                               f"€{LOW_BALANCE_EUR:.0f} and the low-balance guard is not armed.",
                               source="engine")
+                return None
+            if not self._sign_off({
+                    "side": "buy", "symbol": sym, "isin": inst["isin"], "size": size,
+                    "kind": inst.get("kind"), "limit": round(limit, 4),
+                    "value_eur": round(size * limit, 2), "spot": quote.price,
+                    "target_spot": tgt, "barrier": inst.get("barrier"),
+                    "confidence": w.get("confidence"), "instant": instant,
+                    "reason": f"{direction} signal, conf {float(w.get('confidence') or 0):.2f}"}):
                 return None
             res = self.broker.place_limit_order(inst["isin"], "buy", size, limit,
                                                 exchange=inst.get("exchange") or "LSX")
@@ -1289,7 +1639,7 @@ class Engine:
             _, ceiling = self._budget_bounds(quote, decision, genome_id)
         else:
             fee = getattr(self.broker, "fee", 0.0)
-            ceiling = min(self.broker.cash(),
+            ceiling = min(self._cash(),
                           econ.net_worth_eur * self.settings.risk.max_position_fraction)
         floor = min_notional_for_fee(fee, pct)
         if ceiling >= floor:
@@ -1363,6 +1713,13 @@ class Engine:
                 self.bus.warn(
                     f"LIVE knockout {ko.isin}: budget too small for one "
                     f"certificate at {ko.price:.2f} — skipping.", source="engine")
+                return True
+            if not self._sign_off({
+                    "side": "buy", "symbol": quote.symbol, "isin": ko.isin,
+                    "size": size, "kind": ko.kind, "price": ko.price,
+                    "value_eur": round(size * ko.price, 2), "spot": quote.price,
+                    "barrier": ko.barrier, "confidence": decision.confidence,
+                    "reason": f"{decision.direction} signal: {decision.rationale}"[:300]}):
                 return True
             res = self.broker.place_order(ko.isin, "buy", float(size),
                                           exchange=getattr(ko, "exchange", None) or "LSX")
@@ -1441,7 +1798,7 @@ class Engine:
         pos = self.store.position(quote.symbol)
         if decision.direction == "buy" and not pos:
             sizing = size_position(
-                price=quote.price, cash=self.broker.cash(),
+                price=quote.price, cash=self._cash(),
                 equity=econ.net_worth_eur, confidence=decision.confidence,
                 cfg=self.settings.risk,
                 fee=getattr(self.broker, "fee", 0.0))
@@ -1469,7 +1826,9 @@ class Engine:
     # ------------------------------------------------------------------- cycle
     def run_cycle(self) -> None:
         self.process_close_requests()
-        self._run_scheduled_jobs()
+        market_open = self._market_status()["open"]
+        if market_open:
+            self._run_scheduled_jobs()
 
         symbols = list(dict.fromkeys(
             self.settings.universe + [self.settings.benchmark.symbol]))
@@ -1484,6 +1843,7 @@ class Engine:
             quotes = {s: self.market.quote(s) for s in symbols}
         # Cycle-wide histories for cross-sectional strategies (see _decide).
         self._cycle_histories = {s: q.history for s, q in quotes.items()}
+        self._last_bars.update({s: list(q.history or [])[-30:] for s, q in quotes.items()})
         prices: dict[str, float] = {}     # valuation prices: fresh, or last-known-good
         tradeable: set[str] = set()        # symbols with a FRESH trustworthy quote
         degraded: list[str] = []
@@ -1506,7 +1866,7 @@ class Engine:
         # exits always run (even when halted), but only for symbols with a
         # fresh trustworthy quote — never mark/close against a stale or
         # mismatched-source price.
-        self._manage_options(prices, tradeable)
+        self._manage_options({s: exit_price(quotes[s]) for s in tradeable}, tradeable)
         for symbol in self.settings.universe:
             if symbol not in tradeable:
                 continue
@@ -1523,7 +1883,7 @@ class Engine:
                             self.broker.mode, why, None))
                         self.bus.activity("trade", f"SELL {symbol} — {why}", symbol)
 
-        cash = self.broker.cash()
+        cash = self._cash()
         # Liquidation value: what the holdings are worth after the exit fee
         # each one still costs to sell.
         total_value = (self._positions_value(prices) + self._options_value(prices)
@@ -1554,6 +1914,11 @@ class Engine:
             f"{'SELF-SUSTAINING' if econ.self_sustaining else 'subsidised'}",
             detail=econ.as_dict())
 
+        self._publish_market_status()
+        if not econ.sanity_breached and self._market_status()["open"]:
+            self._signal_exits(quotes, tradeable)   # held positions vs current signals
+            if not econ.halt_trading:
+                self._dip_buys(quotes, tradeable)
         if econ.sanity_breached:
             self.bus.error(
                 f"SANITY BREACH: net worth €{econ.net_worth_eur:.2f} exceeds "
@@ -1565,6 +1930,11 @@ class Engine:
             self.bus.warn(
                 f"Runway {econ.runway_hours:.1f}h < floor — exits only.",
                 source="economics")
+        elif not market_open:
+            nxt = self._market_status().get("next_open")
+            when = time.strftime("%a %H:%M", time.localtime(nxt)) if nxt else "the next session"
+            self.bus.info(f"[market] closed — signals, news, analysis and commentary "
+                          f"paused until {when}", source="engine")
         else:
             open_count = len(self.store.open_options()) + len(self.store.positions())
             slots = self.settings.loop.max_positions - open_count
@@ -1581,6 +1951,7 @@ class Engine:
             for symbol in self.settings.universe:
                 self._check_exits_fast()      # keep exits responsive mid-cycle
                 self._tr_heartbeat()
+                self._position_commentary_tick()
                 if slots <= 0:
                     break
                 if symbol not in tradeable:
@@ -1662,7 +2033,7 @@ class Engine:
             if self.settings.entry.watch_enabled:
                 self._prune_watchlist_entered()
 
-        cash = self.broker.cash()
+        cash = self._cash()
         equity = (cash + self._positions_value(prices) + self._options_value(prices)
                   - self._open_exit_fees())
         fees = self.store.total_costs().get("fee", 0.0)

@@ -7,7 +7,7 @@ browser's TLS fingerprint, which this project's sandboxed proxy environments
 cannot pass through (the handshake is reset) — plain httpx against the same
 Yahoo endpoint works fine. Falls back to a deterministic synthetic
 random-walk generator on any fetch failure, so the bot always runs — offline,
-in CI, or on a fresh Vast.ai box before network/keys are set.
+in CI, or on a fresh machine before network/keys are set.
 """
 from __future__ import annotations
 
@@ -69,6 +69,7 @@ class MarketData:
         self.intraday = intraday
         self.provider = self._resolve(provider)
         self.fetcher = fetcher or default_yahoo_fetcher
+        self._daily_cache: dict[str, tuple[float, list[float]]] = {}
 
     def _resolve(self, provider: str) -> str:
         if provider == "synthetic":
@@ -94,6 +95,40 @@ class MarketData:
         with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
             results = list(pool.map(self.quote, symbols))
         return dict(zip(symbols, results))
+
+    DAILY_TTL_S = 6 * 3600
+
+    def daily_closes(self, symbol: str) -> list[float] | None:
+        """~2 years of daily closes for the daily-horizon strategies, cached
+        for DAILY_TTL_S. Live mode returns None on failure — never synthetic
+        stand-ins for a real symbol."""
+        hit = self._daily_cache.get(symbol)
+        if hit and time.time() - hit[0] < self.DAILY_TTL_S:
+            return hit[1]
+        if self.provider == "synthetic":
+            closes = self._synthetic_daily(symbol)
+        else:
+            try:
+                # 2y: one Yahoo year is ~251 trading days — fewer than the 253
+                # closes the 12-month momentum rules need.
+                closes = self.fetcher(symbol, "2y", "1d")
+            except Exception:  # noqa: BLE001
+                return None
+            if not closes:
+                return None
+        self._daily_cache[symbol] = (time.time(), closes)
+        return closes
+
+    def _synthetic_daily(self, symbol: str, n: int = 260) -> list[float]:
+        seed = int(hashlib.sha256(symbol.encode()).hexdigest(), 16) % 10_000
+        price = 50.0 + seed % 200
+        day = int(time.time() // 86400)
+        out = []
+        for i in range(n):
+            h = int(hashlib.sha256(f"{symbol}:d{day - n + i}".encode()).hexdigest(), 16)
+            price = max(1.0, price * (1 + 0.015 * ((h % 2000) / 1000.0 - 1.0)))
+            out.append(round(price, 4))
+        return out
 
     # -- live data (Yahoo, via httpx) ------------------------------------------
     def _yahoo_quote(self, symbol: str) -> Quote:

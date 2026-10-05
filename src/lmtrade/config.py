@@ -53,6 +53,13 @@ class ModelConfig(BaseModel):
     cloud_model: str = "claude-haiku-4-5-20251001"
     perplexity_model: str = "sonar"
     weights: dict[str, float] = Field(default_factory=lambda: {"heuristic": 1.0})
+    # LLM decision model (claude_cli provider) and how it is rationed: only
+    # consulted when the cheap votes' pre-screen reaches prescreen_confidence
+    # (or the symbol is held), answers cached decision_cache_minutes.
+    decision_model: str = "claude-opus-5-5"
+    prescreen_confidence: float = 0.5
+    decision_cache_minutes: int = 30
+    screened_providers: list[str] = Field(default_factory=lambda: ["claude_cli", "cloud"])
 
 
 class RiskConfig(BaseModel):
@@ -112,6 +119,10 @@ class LoopConfig(BaseModel):
 
 
 class ResearchConfig(BaseModel):
+    # Live ~300-char Claude commentary on the open positions (0 = off), using
+    # the analysis provider with this cheaper model.
+    commentary_minutes: int = 5
+    commentary_model: str = "claude-opus-5-5"
     news_interval_minutes: int = 60          # hourly Perplexity news
     daily_analysis_interval_hours: int = 24  # daily Claude strategy review
     # "perplexity" (needs PERPLEXITY_API_KEY) or "claude_cli" (local `claude`
@@ -165,6 +176,9 @@ class OptionsConfig(BaseModel):
     # Trailing take-profit on net EUR profit (after entry + exit fee): arms at
     # trail_min_profit_eur / (1 - trail_pct), then closes when profit falls
     # trail_pct below its peak — never below trail_min_profit_eur.
+    # Close a held position when the fused signal for its underlying points
+    # against it with at least this confidence (0 = off).
+    flip_exit_confidence: float = 0.8
     trail_enabled: bool = False
     trail_min_profit_eur: float = 20.0
     trail_pct: float = 0.15
@@ -199,6 +213,35 @@ class LearningConfig(BaseModel):
     evolve_every_trades: int = 10      # run evolution after N closed trades
 
 
+class BudgetConfig(BaseModel):
+    """Cash buckets (core/budget.py), EUR. reserve_eur is never touched by the
+    bot (manual actions); dips_eur only funds dip buys; entries get the rest.
+    Zero in code; config/default.yaml sets the running bot's amounts."""
+    reserve_eur: float = 0.0
+    dips_eur: float = 0.0
+
+
+class DipConfig(BaseModel):
+    """Dip buys: add to a held, losing position when its underlying is
+    >= k_sigma below the intraday SMA (above, for shorts) and the fused
+    signal still backs it with >= min_confidence."""
+    enabled: bool = False
+    k_sigma: float = 1.5
+    min_confidence: float = 0.6
+    # Dip buys are small (<= dips_eur): the 1 EUR fee is a bigger share.
+    max_fee_pct: float = 0.03
+    max_adds: int = 1                  # per position
+    min_barrier_distance: float = 0.10  # knock-outs: spot at least 10% from the barrier
+
+
+class SignoffConfig(BaseModel):
+    """Claude sign-off for automatic live orders (core/signoff.py). Off in
+    code; config/default.yaml turns it on for the running bot."""
+    enabled: bool = False
+    model: str = "claude-opus-5-5"
+    timeout_seconds: float = 120.0
+
+
 class TRConfig(BaseModel):
     # Use real Trade Republic knockout certificates (real ISINs) for paper
     # trading when TR credentials are configured. Strictly optional: without
@@ -209,6 +252,10 @@ class TRConfig(BaseModel):
     # Check every N seconds that TR still answers; re-login immediately when
     # it doesn't. 0 = off.
     heartbeat_seconds: float = 30.0
+    # Trading hours of the certificates' venue (Mon-Fri, Europe/Berlin).
+    # Outside them armed live exits wait and the dashboard disables closing.
+    # "" = always open.
+    market_hours: str = "08:00-22:00"
     target_leverage: float = 5.0    # preferred KO leverage when selecting
 
 
@@ -257,6 +304,9 @@ class Settings(BaseModel):
     learning: LearningConfig = LearningConfig()
     benchmark: BenchmarkConfig = BenchmarkConfig()
     tr: TRConfig = TRConfig()
+    signoff: SignoffConfig = SignoffConfig()
+    budget_split: BudgetConfig = BudgetConfig()
+    dips: DipConfig = DipConfig()
     sizing: SizingConfig = SizingConfig()
     web: WebConfig = WebConfig()
     data: DataConfig = DataConfig()

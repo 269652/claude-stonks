@@ -9,11 +9,12 @@ A trading bot that fuses **LLMs, SLMs and classical financial models** into one
 decision, built around the goal of **paying for its own GPU costs**. Whether it
 reaches that goal is measured by the bot itself — it has not been demonstrated.
 
-It runs on a rented [Vast.ai](https://vast.ai) GPU, serves a small language model
-locally (via Ollama), consults a cloud LLM for hard calls, and uses **Perplexity**
-for web-grounded research. A cost-accounting core continuously measures the
-hourly GPU burn against realised P&L and **halts new entries when the runway
-runs out**, so the bot can't spend its account on compute.
+It runs **locally**. News, the daily market analysis and LLM trading votes go
+through the **Claude CLI** (your Claude subscription, no API key) or, optionally,
+the Anthropic / Perplexity APIs; a small local model can be added via Ollama. A
+cost-accounting core measures compute spend (an hourly GPU rate if you rent
+one, plus inference) against realised P&L and **halts new entries when the
+runway runs out**.
 
 > **Safety first.** LMTrade runs in **paper mode** by default (simulated fills,
 > no real money). Live Trade Republic execution is an explicit, guarded opt-in
@@ -40,7 +41,7 @@ document every available setting.
 
 | Layer | Module | What it does |
 |-------|--------|--------------|
-| **CLI** | `lmtrade.cli` | `run`, `backtest`, `web`, `viz`, `status`, `analyze`, `deploy`, `reset`, `config`, `import-news`, `import-analysis`, `export-ledger` |
+| **CLI** | `lmtrade.cli` | `run`, `backtest`, `web`, `viz`, `status`, `analyze`, `reset`, `config`, `import-news`, `import-analysis`, `export-ledger` |
 | **Backtest** | `backtest.walk_forward` | Walk-forward folds over historical bars; pre-trains the genome population |
 | **Web dashboard** | `lmtrade.web` | Positions (price, P&L, exits, close), watchlist, signals, news, analysis, equity curve, trades, logs, settings |
 | **Inline viz** | `lmtrade.viz` | Notebook-native matplotlib dashboard (Colab/Jupyter) + `lmtrade viz` PNG |
@@ -54,7 +55,6 @@ document every available setting.
 | **Finance** | `finance.*` | SMA/EMA/RSI/MACD indicators, position sizing, stop-loss/take-profit |
 | **Brokers** | `brokers.*` | `PaperBroker` (default) + Trade Republic adapter (knockouts, limit/market orders, armed from the dashboard) |
 | **Economics** | `economics.cost_accounting` | GPU burn accrual, runway, self-sustaining check, spend guardrail |
-| **Infra** | `infra.vast` + `scripts/deploy_vast.sh` | Vast.ai GPU provisioning & pricing |
 
 ## Trading mechanics
 
@@ -91,7 +91,7 @@ to make money.
 ## The self-sustaining loop
 
 ```
- rent GPU (Vast.ai, $/hr) ──► serve SLM + call cloud/Perplexity ──► decisions ──► trades
+ compute ($/hr, optional) ──► Claude CLI / LLM APIs / SLM ──────► decisions ──► trades
         ▲                                                                            │
         │                                                                            ▼
    runway guardrail ◄──── net worth vs (GPU + inference + fees) ◄──── realised P&L
@@ -258,20 +258,6 @@ arm live execution. Without credentials you get synthetic Black-Scholes options.
 > partly verified against a real account. Read
 > [`docs/TRADE_REPUBLIC.md`](docs/TRADE_REPUBLIC.md) before arming it.
 
-#### Vast.ai GPU (run the SLM 24/7)
-
-```bash
-# in .env
-VAST_API_KEY=your-key
-
-lmtrade deploy              # shows the current cheapest GPU offers
-GPU=RTX_3090 bash scripts/deploy_vast.sh
-```
-
-The deploy script provisions the box, installs Ollama, pulls the SLM, and
-launches both the engine and dashboard. Copy your `.env` to the instance
-out-of-band — **never bake secrets into the image**.
-
 ### 4 — Verify
 
 ```bash
@@ -309,7 +295,7 @@ viz.trades_df(); viz.activity_df(); viz.positions_df()   # feeds as DataFrames
 
 The same panels render anywhere matplotlib works; `lmtrade viz` writes them to a
 PNG for headless use. Note Colab is for **testing** — its runtime is ephemeral and
-idles out, so an always-on self-funding bot belongs on the Vast.ai path.
+idles out, so a long-running bot belongs on your own machine.
 
 ## Configuration
 
@@ -367,17 +353,6 @@ keep hourly commits out of your PR history):
 The script pulls with `--rebase` before pushing, so two overlapping firings
 can't silently clobber each other's state.
 
-## Deploying to a Vast.ai GPU
-
-```bash
-lmtrade deploy                 # prints a plan + cheapest GPU offers (needs VAST_API_KEY)
-GPU=RTX_3090 bash scripts/deploy_vast.sh
-```
-
-The onstart script installs Ollama, pulls the SLM, installs LMTrade, and launches
-both the engine and the dashboard. Copy your `.env` to the box out-of-band —
-**never bake secrets into the image.**
-
 ## Tests
 
 ```bash
@@ -423,15 +398,12 @@ Outperformance is *measured*, not promised: the benchmark tracker holds SPY from
 the same starting budget (the retail baseline) and the dashboard shows live
 **alpha** against it.
 
-## GPU sizing (T4 / A100)
+## Compute costs
 
-| GPU | SLM (`LMTRADE_SLM_MODEL`) | Typical Vast.ai rate | `LMTRADE_GPU_USD_PER_HOUR` |
-|-----|---------------------------|----------------------|-----------------------------|
-| Tesla T4 (16 GB) | `qwen2.5:1.5b` | ~$0.10–0.25/hr | `0.20` |
-| A100 (40/80 GB) | `qwen2.5:7b` (or `14b`) | ~$0.60–1.10/hr | `0.80` |
-
-The runway guardrail scales with the rate you configure — a bigger GPU demands
-proportionally more P&L before the bot counts as self-sustaining.
+`economics.gpu_usd_per_hour` (env `LMTRADE_GPU_USD_PER_HOUR`) is the hourly cost
+of any GPU you rent for the optional SLM. Running locally with the Claude CLI,
+set it to `0` — the runway is then unlimited and only inference and trading
+fees count. With a non-zero rate the runway guardrail scales with it.
 
 ## Honest limitations
 

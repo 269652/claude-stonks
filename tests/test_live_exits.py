@@ -64,6 +64,7 @@ def settings(tmp_path: Path) -> Settings:
     s.learning.enabled = False
     s.loop.stale_evict_enabled = False
     s.options.min_hold_hours = 0
+    s.tr.market_hours = ""             # always open: these tests run at any hour
     return s
 
 

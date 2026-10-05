@@ -80,6 +80,8 @@ model:
     cloud: 1.5
     perplexity: 1.2
     strategy: 1.5          # the learned strategy genome's vote
+    evidence: 2.0          # daily-bar evidence rules (strategies/evidence.py)
+    claude_cli: 2.0        # LLM decision (model.decision_model, pre-screened + cached)
     news: 1.0              # hourly news sentiment vote
     analysis: 1.5          # daily Claude market-analysis bias
 
@@ -129,6 +131,23 @@ research:
 benchmark:
   symbol: SPY              # "retail baseline": buy-and-hold SPY
 
+budget_split:              # cash buckets, EUR: the rest of the cash is for new entries
+  reserve_eur: 50          # never used by the bot (manual actions)
+  dips_eur: 50             # only for dip buys into held positions
+
+dips:                      # averaging down held positions on a dip
+  enabled: true
+  k_sigma: 1.5             # underlying this many sigma below the intraday SMA
+  min_confidence: 0.6      # the fused signal must still back the position
+  max_fee_pct: 0.03        # 1 EUR fee on a dip buy of >= ~34 EUR
+  max_adds: 1              # per position
+  min_barrier_distance: 0.10
+
+signoff:                   # Claude reviews every automatic live order before it goes to TR
+  enabled: true
+  model: claude-opus-5-5
+  timeout_seconds: 120
+
 tr:                        # optional real-TR-instrument paper trading
   use_derivatives: true    # inert without TR_PHONE/TR_PIN in the env; when
                            # credentials are present, paper trading selects
@@ -147,7 +166,7 @@ sizing:                    # quantitative sizing layer (public methods, no magic
   storm_size_factor: 0.5
 
 economics:
-  gpu_usd_per_hour: 0.20       # Vast.ai hourly burn (T4 ~0.15-0.25, A100 ~0.6-1.1)
+  gpu_usd_per_hour: 0.20       # hourly cost of a rented GPU, if any (0 when running locally)
   min_runway_hours: 6
   inference_cost:
     slm: 0.0002

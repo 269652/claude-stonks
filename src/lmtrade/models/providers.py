@@ -1,7 +1,7 @@
 """Concrete model providers.
 
 - HeuristicProvider: pure financial-model signal (no external calls, zero cost).
-- LocalSLMProvider:  small model via Ollama on the Vast.ai GPU box.
+- LocalSLMProvider:  small model via Ollama (local or on a GPU host).
 - CloudLLMProvider:  hosted LLM (Anthropic) for harder judgment calls.
 - PerplexityProvider: web-grounded research/news sentiment.
 
@@ -69,12 +69,21 @@ def _parse_decision(text: str, provider: str, cost: float) -> Signal:
 def _prompt(symbol: str, context: dict) -> str:
     ind = context.get("indicators", {})
     news = context.get("research", "")
+    votes = context.get("votes") or []
+    vote_lines = "\n".join(f"- {p}: {d} {c:.2f} ({r[:120]})" for p, d, c, r in votes) or "- none"
+    held = context.get("held")
+    held_line = (f"Currently held: {held} position (a strong opposite call closes it).\n"
+                 if held else "Not currently held.\n")
     return (
-        f"You are a disciplined trading analyst for a tiny (~10 EUR) account.\n"
+        "You are a disciplined trading analyst for a small account that trades "
+        "leveraged knock-out certificates (flat 1 EUR fee per order).\n"
         f"Instrument: {symbol}\n"
-        f"Indicators: {json.dumps(ind, default=str)}\n"
-        f"Research notes: {news[:800]}\n\n"
-        "Decide the action for the NEXT step. Respond ONLY with JSON: "
+        f"{held_line}"
+        f"Indicators (intraday): {json.dumps(ind, default=str)}\n"
+        f"Other signals (daily evidence rules, strategy, news, daily analysis):\n{vote_lines}\n"
+        f"News: {news[:800] or 'none'}\n\n"
+        "Weigh these and decide the action for the NEXT step. Use confidence 1.0 only "
+        "when the case is overwhelming. Respond ONLY with JSON: "
         '{"direction":"buy|sell|hold","confidence":0..1,"rationale":"one sentence"}'
     )
 
@@ -128,7 +137,7 @@ class HeuristicProvider(ModelProvider):
 
 
 class LocalSLMProvider(ModelProvider):
-    """Small language model served by Ollama (typically on the Vast.ai GPU)."""
+    """Small language model served by Ollama (locally or on a GPU host)."""
 
     name = "slm"
 
@@ -252,6 +261,7 @@ class ClaudeCLIProvider(ModelProvider):
                  model: str | None = None):
         self.timeout = (settings.research.claude_cli_timeout_seconds
                         if settings is not None else CLAUDE_CLI_TIMEOUT)
+        self.model = model
         self._runner = runner or (
             functools.partial(_default_claude_cli_runner, model=model)
             if model else _default_claude_cli_runner)
@@ -361,7 +371,7 @@ def build_providers(settings: Settings) -> dict[str, ModelProvider]:
         "slm": lambda: LocalSLMProvider(settings),
         "cloud": lambda: CloudLLMProvider(settings),
         "perplexity": lambda: PerplexityProvider(settings),
-        "claude_cli": lambda: ClaudeCLIProvider(settings),
+        "claude_cli": lambda: ClaudeCLIProvider(settings, model=settings.model.decision_model),
     }
     out: dict[str, ModelProvider] = {}
     for name in settings.model.stack:

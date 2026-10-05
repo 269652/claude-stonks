@@ -322,6 +322,18 @@ class Store:
             self._conn.commit()
             return int(cur.lastrowid)
 
+    def add_to_option(self, opt_id: int, contracts: float, price: float) -> None:
+        """Average into an open position: more contracts at `price`, entry
+        premium becomes the size-weighted average."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE option_positions SET entry_premium="
+                "(entry_premium*contracts + ?*?)/(contracts + ?), contracts=contracts + ? "
+                "WHERE id=? AND status='open'",
+                (price, contracts, contracts, contracts, opt_id),
+            )
+            self._conn.commit()
+
     def close_option(self, opt_id: int, exit_premium: float, pnl: float) -> None:
         with self._lock:
             self._conn.execute(

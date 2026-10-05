@@ -52,6 +52,7 @@ def settings(tmp_path: Path) -> Settings:
     s.options.enabled = True
     s.learning.enabled = False
     s.tr.use_derivatives = True
+    s.tr.market_hours = ""             # always open: these tests run at any hour
     return s
 
 
@@ -792,7 +793,9 @@ class TestEngineIntegration:
         settings.options.min_hold_hours = 1000.0
         client = FakeTRDerivatives(catalog={})
         broker = PaperBroker(store, starting_cash=settings.budget, fee=0.1)
-        market = ScriptedMarket({"AAPL": Quote("AAPL", 94.0, [100.0] * 60, "yahoo")})
+        # a sustained move through the barrier (one bar alone is de-spiked)
+        market = ScriptedMarket({"AAPL": Quote("AAPL", 94.0, [100.0] * 57 + [94.0] * 3,
+                                               "yahoo")})
         store.open_option("AAPL", "ko_call", strike=95.0, expiry_ts=4e12,
                           iv=0.0, contracts=10.0, entry_premium=0.55,
                           genome_id=None, tp_premium=0.85, sl_premium=0.30,

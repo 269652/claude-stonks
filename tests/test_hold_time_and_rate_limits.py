@@ -37,6 +37,7 @@ def settings(tmp_path: Path) -> Settings:
     s.data_dir = tmp_path
     s.loop.interval_seconds = 1
     s.risk.min_confidence = 1.1
+    s.options.flip_exit_confidence = 0.0   # isolate time-based exits from signal exits
     s.options.enabled = True
     s.learning.enabled = False
     s.risk.max_fee_pct = 0.0   # these tests are about slot caps, not fee drag
@@ -127,7 +128,7 @@ class TestMaxHoldHours:
     def test_disabled_by_default_zero(self, settings, store):
         assert settings.options.max_hold_hours == 0.0
         market = ScriptedMarket({
-            "AAPL": Quote("AAPL", 313.0, [300.0] * 60, "yahoo"),
+            "AAPL": Quote("AAPL", 313.0, [300.0] * 57 + [313.0] * 3, "yahoo"),
         })
         opened_ts = time.time() - 1000 * 3600  # ancient position
         broker = PaperBroker(store, starting_cash=settings.budget, fee=0.1)

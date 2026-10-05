@@ -20,7 +20,7 @@ Every change to this codebase must follow test-driven development:
    it must add or change tests in the same commit.
 
 Tests must be runnable **offline with no API keys** — external services
-(Ollama, Anthropic, Perplexity, Yahoo Finance, Vast.ai, Trade Republic) are
+(Ollama, Anthropic, Perplexity, Claude CLI, Yahoo Finance, Trade Republic) are
 always optional at runtime and must be faked/stubbed or skipped in tests. The
 synthetic market-data provider exists for exactly this purpose. Live market
 data goes through `httpx` directly against Yahoo's chart API — not the
@@ -29,10 +29,11 @@ impersonation that breaks under some sandboxed/proxied networks.
 
 ## Project overview
 
-LMTrade is a self-sustaining trading bot: it fuses classical financial models,
-local SLMs (Ollama), cloud LLMs (Anthropic) and Perplexity research into
-trading decisions, and its economics layer enforces that it halts when it can
-no longer pay for its own GPU (Vast.ai) runway.
+LMTrade is a trading bot that runs locally: it fuses classical financial
+models, an optional local SLM (Ollama) and LLM research / analysis (the local
+Claude CLI, or the Anthropic / Perplexity APIs) into trading decisions. Its
+economics layer halts new entries when the runway for its compute costs
+(economics.gpu_usd_per_hour, 0 when nothing is rented) runs out.
 
 - **Paper mode is the default.** Live Trade Republic execution is unofficial
   (pytr), against TR ToS, and stays behind a deliberate guard. Never enable it
@@ -49,7 +50,7 @@ no longer pay for its own GPU (Vast.ai) runway.
 pip install -e '.[dev]'     # install with test deps
 python -m pytest            # full suite — must pass before any commit
 lmtrade run --cycles 3 --interval 1   # quick engine smoke run
-lmtrade status | web | viz | deploy | reset | config
+lmtrade status | web | viz | reset | config
 ```
 
 ## Conventions

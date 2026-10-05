@@ -84,7 +84,10 @@ def make(settings, store, tr=None):
 
 
 def force(e, conf=0.9, direction="buy"):
-    e._decide = lambda q: (Decision(q.symbol, direction, conf, "forced"), None)
+    # with a supporting heuristic vote, so instant entries are "supported"
+    from lmtrade.models.base import Signal
+    sup = [Signal("heuristic", direction, 0.8, "supports", 0.0)]
+    e._decide = lambda q: (Decision(q.symbol, direction, conf, "forced", sup), None)
 
 
 def watched(store):
@@ -195,3 +198,32 @@ class TestInstantEntries:
         e.run_cycle()
         row = TestClient(create_app(settings)).get("/api/watchlist").json()[0]
         assert row["instant"] is True and row["sigma_to_go"] == 0
+
+
+class TestInstantNeedsAgreement:
+    """A high-confidence signal only skips the watch-list timing when the
+    heuristics, news and analysis support it (none against, at least one for)."""
+
+    def run(self, settings, store, signals):
+        settings.universe = ["AAPL"]
+        settings.entry.limit_orders = False
+        e, m = make(settings, store)
+        m.price["AAPL"] = 101.5                    # stretched against a buy
+        from lmtrade.models.base import Signal
+        sigs = [Signal(p, d, 0.8, "x", 0.0) for p, d in signals]
+        e._decide = lambda q: (Decision(q.symbol, "buy", 1.0, "forced", sigs), None)
+        e.run_cycle()
+        return store
+
+    def test_supported_goes_in_now(self, settings, store):
+        st = self.run(settings, store, [("heuristic", "buy"), ("news", "buy")])
+        assert len(st.open_options()) == 1
+
+    def test_contradicted_waits(self, settings, store):
+        st = self.run(settings, store, [("heuristic", "buy"), ("analysis", "sell")])
+        assert st.open_options() == []
+        assert (st.get_meta("watchlist") or {})["AAPL"]["instant"] is False
+
+    def test_unsupported_waits(self, settings, store):
+        st = self.run(settings, store, [("evidence", "buy")])   # none of the three voted
+        assert st.open_options() == []

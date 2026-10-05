@@ -1,6 +1,6 @@
 """The self-sustaining loop.
 
-The bot rents a GPU on Vast.ai by the hour. To "pay for its own GPU costs" it
+If the bot runs on a rented GPU, that costs money by the hour. To "pay for its own GPU costs" it
 must earn more than it burns. This module:
 
   1. Accrues the GPU rental cost continuously (USD/hr).
