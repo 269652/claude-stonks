@@ -91,3 +91,22 @@ def validate_override(o: dict, payload: dict, fee: float) -> tuple[dict | None, 
     return {"tp_pnl": tp, "sl_pnl": sl, "trail_enabled": trail_enabled,
             "trail_min_profit_eur": t_min if ok_min else None,
             "trail_pct": t_pct if ok_pct else None}, None
+
+
+def atr_exit_levels(kind: str, spot: float, atr: float | None,
+                    price_at, entry: float, tp_mult: float,
+                    sl_mult: float) -> tuple[float, float] | None:
+    """(tp, sl) premiums: the position's price when the underlying moves
+    tp_mult x ATR in favour / sl_mult x ATR against. None when there is no
+    ATR or the levels don't bracket the entry (then use the % levels)."""
+    if not atr or atr <= 0:
+        return None
+    up = 1.0 if kind in ("call", "ko_call") else -1.0
+    tp = price_at(spot + up * tp_mult * atr)
+    sl = price_at(spot - up * sl_mult * atr)
+    if tp is None or sl is None:
+        return None
+    sl = max(0.0, sl)
+    if not tp > entry > sl:
+        return None
+    return tp, sl

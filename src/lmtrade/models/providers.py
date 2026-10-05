@@ -355,6 +355,10 @@ class PerplexityProvider(ModelProvider):
             return f"(research unavailable: {exc})", 0.0
 
     def analyze(self, symbol: str, context: dict) -> Signal:
+        if not self.key:
+            # Without its own research it would only re-read the stored news
+            # (already the `news` signal) — a double count.
+            return Signal(self.name, "hold", 0.5, "no Perplexity key", 0.0)
         text = context.get("research", "")
         low = text.lower()
         if "bullish" in low:

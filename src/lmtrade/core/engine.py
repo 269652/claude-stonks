@@ -47,7 +47,7 @@ from .control import LOW_BALANCE_EUR
 from .events import EventBus
 from .scheduler import Scheduler
 from .state import Position, Store, Trade
-from .exits import exit_plan
+from .exits import atr_exit_levels, exit_plan
 from .budget import split_cash
 from .market_hours import market_status, next_open
 from .signoff import SignOff
@@ -643,7 +643,7 @@ class Engine:
             if peaks.pop(key, None) is not None:   # P&L baseline changed
                 self.store.set_meta("trail_peaks", peaks)
             self.store.record_trade(Trade(sym, "buy", float(size), price, OPTION_FEE,
-                                          self.broker.mode, why, o.get("genome_id")))
+                                          self.broker.mode, why, decision.confidence))
             self.bus.activity("trade", f"DIP BUY {o['kind'].upper()} {sym} x{size} @ "
                                        f"{price:.3f} — {why}", sym)
 
@@ -1060,6 +1060,23 @@ class Engine:
         return fee_aware_budget(sized, ceiling, OPTION_FEE,
                                 self.settings.risk.max_fee_pct)
 
+    def _sizing_history(self, quote: Quote) -> list[float]:
+        """Daily closes for volatility targeting / the regime filter (both
+        annualise per day); the intraday history only as a fallback."""
+        try:
+            daily = self.market.daily_closes(quote.symbol)
+        except Exception:  # noqa: BLE001
+            daily = None
+        return list(daily) if daily else list(quote.history or [])
+
+    def _entry_min_confidence(self, quote: Quote) -> float:
+        """risk.min_confidence, raised in a storm regime — measured edges
+        are the first casualty when the volatility regime flips."""
+        s = self.settings
+        if s.sizing.regime_filter_enabled and regime(self._sizing_history(quote)) == "storm":
+            return s.risk.min_confidence + s.sizing.storm_extra_confidence
+        return s.risk.min_confidence
+
     def _budget_bounds(self, quote: Quote, decision: Decision,
                        genome_id: str | None) -> tuple[float, float]:
         """Premium budget for a new position, layering the quant sizing rules:
@@ -1089,8 +1106,9 @@ class Engine:
             kf = kelly_fraction(g.win_rate, g.avg_win, g.avg_loss) \
                 * s.kelly_fraction_of_full
             fraction = min(cfg.max_option_fraction, kf)
-        fraction *= vol_scale(quote.history, s.vol_target_annual)
-        if s.regime_filter_enabled and regime(quote.history) == "storm":
+        daily = self._sizing_history(quote)
+        fraction *= vol_scale(daily, s.vol_target_annual)
+        if s.regime_filter_enabled and regime(daily) == "storm":
             fraction *= s.storm_size_factor
 
         # Cash reserve: cap the budget so total deployed capital never exceeds
@@ -1193,6 +1211,22 @@ class Engine:
         self.store.set_meta("watchlist_expired", expired)
         return triggered
 
+    def _entry_block(self, decision: Decision) -> str | None:
+        """Why a signal may not become an entry (entry.require_daily_setup):
+        no matching daily setup, or news against it. None = allowed."""
+        if not self.settings.entry.require_daily_setup:
+            return None
+        ev = next((s for s in (decision.signals or []) if s.provider == "evidence"), None)
+        if ev is None or ev.direction != decision.direction:
+            got = "none" if ev is None else ev.direction
+            return f"no daily setup (evidence rules: {got})"
+        latest = self.store.latest_news(decision.symbol)
+        if latest and (self.now() - latest["ts"]) < NEWS_MAX_AGE_S:
+            against = {"buy": "bearish", "sell": "bullish"}[decision.direction]
+            if latest.get("sentiment") == against:
+                return f"news is {against}"
+        return None
+
     SUPPORT_PROVIDERS = ("heuristic", "news", "analysis")
 
     def _supported_by_context(self, decision: Decision) -> bool:
@@ -1245,6 +1279,26 @@ class Engine:
             return None
         cache[cur] = (float(q.price), time.time())
         return float(q.price)
+
+    def _initial_exits(self, symbol: str, kind: str, spot: float | None, entry: float,
+                       price_at) -> tuple[float, float]:
+        """(tp, sl) premiums for a new position: from the underlying's daily
+        ATR when options.atr_exits (and the data allows), else the % levels."""
+        cfg = self.settings.options
+        if cfg.atr_exits and spot:
+            from ..finance.indicators import daily_atr
+            try:
+                closes = self.market.daily_closes(symbol)
+            except Exception:  # noqa: BLE001 — no daily data: % fallback
+                closes = None
+            atr = daily_atr(closes or [], cfg.atr_window)
+            levels = atr_exit_levels(kind, spot, atr, price_at, entry,
+                                     cfg.atr_tp_mult, cfg.atr_sl_mult)
+            if levels:
+                self.bus.info(f"[exits] {symbol}: ATR {atr:.2f} -> TP {levels[0]:.3f} / "
+                              f"SL {levels[1]:.3f} (entry {entry:.3f})", source="engine")
+                return levels
+        return entry * (1 + cfg.take_profit_pct), entry * (1 - cfg.stop_loss_pct)
 
     def _anchored_price(self, ref_price: float, ref_spot: float, size: float,
                         currency: str | None, kind: str, spot: float,
@@ -1463,12 +1517,14 @@ class Engine:
                               f"not booked", source="engine")
                 return
         self.store.record_cost("fee", OPTION_FEE, "options")
-        cfg = self.settings.options
+        anchored = ({**inst, "ref_price": price, "ref_spot": spot}
+                    if inst.get("ref_price") and spot else inst)
+        tp, sl = self._initial_exits(sym, inst["kind"], spot, price,
+                                     lambda s: self._instrument_price(anchored, s))
         oid = self.store.open_option(
             sym, inst["kind"], inst["strike"], inst["expiry_ts"], inst.get("iv") or 0.0,
             contracts, price, p.get("genome_id"),
-            tp_premium=price * (1 + cfg.take_profit_pct),
-            sl_premium=price * (1 - cfg.stop_loss_pct),
+            tp_premium=tp, sl_premium=sl,
             instrument_type=inst["instrument_type"], barrier=inst.get("barrier"),
             ratio=inst.get("ratio"), isin=inst.get("isin"))
         if inst.get("ref_price") and spot:
@@ -1669,7 +1725,6 @@ class Engine:
                               self.settings.tr.target_leverage)
         if ko is None or ko.price <= 0:
             return False
-        cfg = self.settings.options
         budget = self._position_budget(quote, decision, genome_id)
         if budget <= 0.05:
             return True   # handled (deliberately no trade), don't fall back
@@ -1737,8 +1792,12 @@ class Engine:
             if not self.broker.adjust_cash(-cost):
                 return True
             self.store.record_cost("fee", OPTION_FEE, "options")
-        tp_premium = ko.price * (1 + cfg.take_profit_pct)
-        sl_premium = ko.price * (1 - cfg.stop_loss_pct)
+        ko_inst = {"kind": ko.kind, "barrier": ko.barrier, "ref_price": ko.price,
+                   "ref_spot": quote.price, "size": 1.0 / ko.ratio if ko.ratio else 1.0,
+                   "currency": getattr(ko, "currency", "EUR") or "EUR"}
+        tp_premium, sl_premium = self._initial_exits(
+            quote.symbol, ko.kind, quote.price, ko.price,
+            lambda s: self._instrument_price(ko_inst, s))
         # KOs are open-ended: expiry far out; the barrier is the real risk.
         expiry_ts = self.now() + 365 * 86400.0
         self.store.open_option(
@@ -1779,8 +1838,11 @@ class Engine:
         self.store.record_cost("fee", OPTION_FEE, "options")
         # Explicit stops placed with the order: every position always carries
         # its own TP/SL, immune to later config changes.
-        tp_premium = oq.premium * (1 + cfg.take_profit_pct)
-        sl_premium = oq.premium * (1 - cfg.stop_loss_pct)
+        opt_inst = {"instrument_type": "option", "kind": kind, "strike": oq.strike,
+                    "expiry_ts": oq.expiry_ts, "iv": oq.iv, "barrier": None}
+        tp_premium, sl_premium = self._initial_exits(
+            quote.symbol, kind, quote.price, oq.premium,
+            lambda s: self._instrument_price(opt_inst, s))
         self.store.open_option(quote.symbol, kind, oq.strike, oq.expiry_ts,
                                oq.iv, contracts, oq.premium, genome_id,
                                tp_premium=tp_premium, sl_premium=sl_premium)
@@ -1961,6 +2023,9 @@ class Engine:
                     continue
                 if not self.accountant.can_afford_inference(econ, est_usd=0.01):
                     break
+                if self.settings.entry.require_daily_setup and not (
+                        self._tr_tradable(symbol, "buy") or self._tr_tradable(symbol, "sell")):
+                    continue   # no TR knockout either way: don't spend analysis on it
                 self._poll_close_requests()   # manual closes stay snappy mid-cycle
                 decision, genome_id = self._decide(quotes[symbol])
                 evaluated.add(symbol)
@@ -1970,11 +2035,14 @@ class Engine:
                     symbol, decision.as_dict())
                 # Storm regime: demand extra conviction — measured edges are
                 # the first casualty when the volatility regime flips.
-                min_conf = self.settings.risk.min_confidence
-                if (self.settings.sizing.regime_filter_enabled
-                        and regime(quotes[symbol].history) == "storm"):
-                    min_conf += self.settings.sizing.storm_extra_confidence
+                min_conf = self._entry_min_confidence(quotes[symbol])
                 if decision.direction == "hold" or decision.confidence < min_conf:
+                    continue
+                block = self._entry_block(decision)
+                if block:
+                    self.bus.info(f"[setup] {symbol}: {decision.direction.upper()} conf "
+                                  f"{decision.confidence:.2f} not entered — {block}",
+                                  source="engine")
                     continue
                 if not self._fee_feasible(quotes[symbol], decision, genome_id, econ):
                     continue

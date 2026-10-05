@@ -60,6 +60,9 @@ class ModelConfig(BaseModel):
     prescreen_confidence: float = 0.5
     decision_cache_minutes: int = 30
     screened_providers: list[str] = Field(default_factory=lambda: ["claude_cli", "cloud"])
+    # Computed and shown, but no vote on direction / confidence (intraday or
+    # duplicated information, e.g. the 1-minute heuristic).
+    non_voting: list[str] = Field(default_factory=list)
 
 
 class RiskConfig(BaseModel):
@@ -150,6 +153,9 @@ class EntryConfig(BaseModel):
     build Settings() directly keep immediate entries; config/default.yaml
     turns it on for the running bot."""
     watch_enabled: bool = False
+    # Entries need a daily setup: the evidence vote (daily rules) must point
+    # the same way; bullish/bearish news against the trade vetoes it.
+    require_daily_setup: bool = False
     watch_k: float = 1.0           # enter at >= k sigma from the intraday SMA
     watch_window: int = 60         # bars of history for the SMA / std
     watch_max_hours: float = 4.0   # drop the watch entry after this long
@@ -173,6 +179,13 @@ class OptionsConfig(BaseModel):
     max_option_fraction: float = 0.3   # max fraction of equity in one premium
     take_profit_pct: float = 0.5       # +50% premium -> take profit
     stop_loss_pct: float = 0.4         # -40% premium -> cut
+    # Exits sized to the underlying's daily range instead (core/exits.py
+    # atr_exit_levels): TP at +atr_tp_mult x ATR, SL at -atr_sl_mult x ATR
+    # of the underlying; the % levels above remain the fallback.
+    atr_exits: bool = False
+    atr_tp_mult: float = 3.0
+    atr_sl_mult: float = 2.0
+    atr_window: int = 14
     # Trailing take-profit on net EUR profit (after entry + exit fee): arms at
     # trail_min_profit_eur / (1 - trail_pct), then closes when profit falls
     # trail_pct below its peak — never below trail_min_profit_eur.

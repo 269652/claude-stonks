@@ -121,8 +121,9 @@ class FusionEngine:
     def _net(self, signals: list[Signal]) -> float:
         """Weighted mean signed conviction of the directional votes (-1..1)."""
         num = den = 0.0
+        skip = set(self.settings.model.non_voting)
         for s in signals:
-            if s.direction == "hold":
+            if s.direction == "hold" or s.provider in skip:
                 continue
             w = self.weights.get(s.provider, 1.0)
             num += w * s.signed()

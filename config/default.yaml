@@ -61,7 +61,7 @@ loop:
                            # impossible via its API). Override with
                            # `lmtrade run --interval N` or config.toml.
   exit_check_seconds: 10   # re-check TP/SL/trailing of open positions this often
-  max_positions: 8         # cap concurrent open positions — deliberately far
+  max_positions: 2         # cap concurrent open positions — deliberately far
                            # below universe size; slots go to the strongest
                            # ranked signals across the whole universe each
                            # cycle, not first-come-first-served by list order
@@ -71,6 +71,9 @@ loop:
 
 model:
   stack: [heuristic, slm, perplexity]   # providers consulted, in order
+  # Shown but not voting: 1-minute indicators (heuristic, slm) and duplicated
+  # news reads (perplexity keyword scan, news sentiment — a veto instead).
+  non_voting: [heuristic, slm, perplexity, news]
   slm_model: "qwen2.5:1.5b"             # T4-sized; use qwen2.5:7b on an A100
   cloud_model: "claude-haiku-4-5-20251001"
   perplexity_model: "sonar"
@@ -94,6 +97,10 @@ risk:
 
 options:                   # synthetic Black-Scholes options layer (paper)
   enabled: true
+  atr_exits: true          # new positions: TP / SL at +3 / -2 x the underlying's daily ATR
+  atr_tp_mult: 3.0
+  atr_sl_mult: 2.0
+  atr_window: 14
   expiry_days: 7
   max_option_fraction: 0.15  # max fraction of equity in one premium — lower
                              # than a small-universe default since up to
@@ -108,6 +115,7 @@ options:                   # synthetic Black-Scholes options layer (paper)
 
 entry:                     # watch-list entry timing (core/watchlist.py)
   watch_enabled: true      # signals wait for a better price instead of market entry
+  require_daily_setup: true  # entries need the daily evidence rules to agree
   watch_k: 1.0             # enter at >= 1 sigma below (buy) / above (sell) the intraday SMA
   watch_window: 60         # bars used for that SMA / std (1m bars intraday)
   watch_max_hours: 4.0     # drop the watch entry if no good entry comes within this time
@@ -118,7 +126,7 @@ entry:                     # watch-list entry timing (core/watchlist.py)
   market_above_sigma_pct: 1.0  # intraday sigma >= 1% of price: market order on trigger, no limit
 
 learning:                  # evolutionary strategy optimizer
-  enabled: true
+  enabled: false           # off: its genomes ran on 1-minute bars; to be rebuilt on daily
   population: 14           # ~2 genomes per family (7 families)
   epsilon: 0.2               # exploration rate
   mutation_scale: 0.3

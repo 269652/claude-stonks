@@ -96,3 +96,13 @@ def indicator_snapshot(prices: list[float] | np.ndarray) -> dict[str, float | No
         "vol": volatility(prices, 20),
         "trend": trend(prices, 50),
     }
+
+
+def daily_atr(closes: list[float], window: int = 14) -> float | None:
+    """Average absolute close-to-close move over the last `window` days (an
+    ATR from closes only). None with too little data or no movement."""
+    if window <= 0 or len(closes) < window + 1:
+        return None
+    tail = [float(x) for x in closes[-(window + 1):]]
+    atr = sum(abs(b - a) for a, b in zip(tail, tail[1:])) / window
+    return atr if atr > 0 else None
